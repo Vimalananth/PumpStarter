@@ -8,11 +8,14 @@ const admin = require('firebase-admin');
 // On Railway: set FIREBASE_SERVICE_ACCOUNT env var to the full JSON content
 //             of serviceAccountKey.json (paste the whole file as one line).
 // Locally:    set the same env var, or fall back to serviceAccountKey.json file.
+console.log('[Init] FIREBASE_SERVICE_ACCOUNT set:', !!process.env.FIREBASE_SERVICE_ACCOUNT);
+console.log('[Init] FIREBASE_DB_URL:', process.env.FIREBASE_DB_URL || '(using default)');
+
 let serviceAccount;
 if (process.env.FIREBASE_SERVICE_ACCOUNT) {
   serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
 } else {
-  serviceAccount = require('./serviceAccountKey.json');
+  throw new Error('FIREBASE_SERVICE_ACCOUNT env var is not set. Set it in Railway Variables tab.');
 }
 
 admin.initializeApp({
