@@ -38,8 +38,8 @@ const mqttClient = mqtt.connect(BROKER_URL, {
 const PUMPS = ['pump01', 'pump02'];
 
 const TOPICS_SUB = [
-  'pump/01/status', 'pump/01/alerts',
-  'pump/02/status', 'pump/02/alerts'
+  'pump/01/status', 'pump/01/alerts', 'pump/01/ota/status',
+  'pump/02/status', 'pump/02/alerts', 'pump/02/ota/status'
 ];
 
 // pump/01/status  ->  { pumpId: 'pump01', type: 'status' }
@@ -68,6 +68,14 @@ mqttClient.on('message', (topic, message) => {
     const payload = JSON.parse(message.toString());
     const { pumpId, type } = topicToFirebase(topic);
     payload.ts = Date.now();
+
+    if (type === 'ota/status') {
+      // OTA progress/result — write to pumps/pump01/ota_status
+      db.ref(`pumps/${pumpId}/ota_status`).set(payload)
+        .then(()  => console.log(`[FB] Written pumps/${pumpId}/ota_status`))
+        .catch(err => console.error('[FB] Write error:', err.message));
+      return;
+    }
 
     db.ref(`pumps/${pumpId}/${type}`).set(payload)
       .then(()  => console.log(`[FB] Written pumps/${pumpId}/${type}`))
@@ -111,6 +119,30 @@ PUMPS.forEach((pumpId) => {
   });
 
   console.log(`[FB] Listening for commands on ${fbPath}`);
+
+  // Firebase → MQTT OTA trigger
+  // Flutter app writes {url: "https://..."} to pumps/pump01/ota
+  // bridge forwards it as MQTT to pump/01/ota so the STM32 starts the download
+  const otaFbPath   = `pumps/${pumpId}/ota`;
+  const otaMqttTopic = `pump/${mqttNum}/ota`;
+  let otaInitialized = false;
+
+  db.ref(otaFbPath).on('value', (snapshot) => {
+    if (!otaInitialized) {
+      otaInitialized = true;
+      return; // skip initial read — only forward new writes
+    }
+    const cmd = snapshot.val();
+    if (!cmd || !cmd.url) return;
+
+    const payload = JSON.stringify({ url: cmd.url });
+    mqttClient.publish(otaMqttTopic, payload, { qos: 1 }, (err) => {
+      if (err) console.error(`[MQTT] OTA publish error on ${otaMqttTopic}:`, err.message);
+      else     console.log(`[FB→MQTT] OTA URL forwarded → ${otaMqttTopic}:`, cmd.url);
+    });
+  });
+
+  console.log(`[FB] Listening for OTA commands on ${otaFbPath}`);
 });
 
 // ─── Offline detection — mark pump offline if no status for 30 s ─────────────
