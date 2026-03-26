@@ -139,7 +139,12 @@ PUMPS.forEach((pumpId) => {
       return; // skip initial read — only forward new writes
     }
     const cmd = snapshot.val();
-    if (!cmd || !cmd.url) return;
+    if (!cmd || !cmd.url) {
+      // OTA node deleted — clear retained MQTT message so board doesn't re-trigger on reconnect
+      mqttClient.publish(otaMqttTopic, '', { qos: 1, retain: true },
+        () => console.log(`[OTA] Cleared retained on ${otaMqttTopic}`));
+      return;
+    }
 
     const payload = JSON.stringify({ url: cmd.url });
     mqttClient.publish(otaMqttTopic, payload, { qos: 1, retain: true }, (err) => {
