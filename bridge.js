@@ -227,21 +227,24 @@ const pendingOtaUrl = {};
 PUMPS.forEach((pumpId) => {
   db.ref(`pumps/${pumpId}/ota`).on('value', (snapshot) => {
     const d = snapshot.val();
+    console.log(`[OTA] ota listener: ${pumpId} =`, JSON.stringify(d));
     if (d && d.url) pendingOtaUrl[pumpId] = d.url;
     else            delete pendingOtaUrl[pumpId];
   });
   db.ref(`pumps/${pumpId}/ota_status`).on('value', (snapshot) => {
+    console.log(`[OTA] ota_status listener: ${pumpId} exists=${snapshot.exists()}`);
     if (snapshot.exists()) delete pendingOtaUrl[pumpId]; // board acknowledged
   });
 });
 
 setInterval(() => {
+  console.log('[OTA] Retry tick, pending:', JSON.stringify(pendingOtaUrl));
   Object.entries(pendingOtaUrl).forEach(([pumpId, url]) => {
     const mqttNum = pumpId.replace('pump', '');
     const topic   = `pump/${mqttNum}/ota`;
     mqttClient.publish(topic, JSON.stringify({ url }), { qos: 1, retain: false }, (err) => {
       if (err) console.error(`[OTA] Retry error on ${topic}:`, err.message);
-      else     console.log(`[OTA] Retry publish → ${topic}:`, url);
+      else     console.log(`[OTA] Retry publish -> ${topic}:`, url);
     });
   });
 }, 30000);
