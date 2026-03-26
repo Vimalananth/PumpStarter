@@ -1,6 +1,6 @@
 {
   "name": "pump-controller-bridge",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "HiveMQ Cloud <-> Firebase bridge for pump controller",
   "main": "bridge.js",
   "scripts": {
