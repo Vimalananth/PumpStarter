@@ -42,10 +42,11 @@ const TOPICS_SUB = [
   'pump/02/status', 'pump/02/alerts', 'pump/02/ota/status'
 ];
 
-// pump/01/status  ->  { pumpId: 'pump01', type: 'status' }
+// pump/01/status        ->  { pumpId: 'pump01', type: 'status' }
+// pump/01/ota/status    ->  { pumpId: 'pump01', type: 'ota/status' }
 function topicToFirebase(topic) {
   const parts = topic.split('/');
-  return { pumpId: 'pump' + parts[1], type: parts[2] };
+  return { pumpId: 'pump' + parts[1], type: parts.slice(2).join('/') };
 }
 
 // ─── MQTT events ──────────────────────────────────────────────────────────────
@@ -74,6 +75,11 @@ mqttClient.on('message', (topic, message) => {
       db.ref(`pumps/${pumpId}/ota_status`).set(payload)
         .then(()  => console.log(`[FB] Written pumps/${pumpId}/ota_status`))
         .catch(err => console.error('[FB] Write error:', err.message));
+      // Clear retained OTA message so board doesn't re-trigger OTA on every reconnect
+      const mqttNum = pumpId.replace('pump', '');
+      const otaTopic = `pump/${mqttNum}/ota`;
+      mqttClient.publish(otaTopic, '', { qos: 1, retain: true },
+        () => console.log(`[MQTT] Cleared retained OTA on ${otaTopic}`));
       return;
     }
 
@@ -136,7 +142,7 @@ PUMPS.forEach((pumpId) => {
     if (!cmd || !cmd.url) return;
 
     const payload = JSON.stringify({ url: cmd.url });
-    mqttClient.publish(otaMqttTopic, payload, { qos: 1 }, (err) => {
+    mqttClient.publish(otaMqttTopic, payload, { qos: 1, retain: true }, (err) => {
       if (err) console.error(`[MQTT] OTA publish error on ${otaMqttTopic}:`, err.message);
       else     console.log(`[FB→MQTT] OTA URL forwarded → ${otaMqttTopic}:`, cmd.url);
     });
@@ -144,6 +150,101 @@ PUMPS.forEach((pumpId) => {
 
   console.log(`[FB] Listening for OTA commands on ${otaFbPath}`);
 });
+
+// ─── Rotation schedule — alternate pumps every N minutes ─────────────────────
+let rotationSchedule = null;
+db.ref('rotation_schedule').on('value', (snapshot) => {
+  rotationSchedule = snapshot.val();
+});
+
+setInterval(() => {
+  const rs = rotationSchedule;
+  if (!rs || !rs.enabled) return;
+
+  const now        = Date.now();
+  const intervalMs = (rs.interval_minutes || 240) * 60 * 1000;
+  const startedAt  = rs.started_at || 0;
+
+  if (startedAt === 0) {
+    // First run — start Pump 1 now
+    mqttClient.publish('pump/01/cmd', JSON.stringify({ relay1: 1, relay2: 0 }), { qos: 1 });
+    db.ref('rotation_schedule').update({ current_pump: 'pump01', started_at: now });
+    console.log('[Rotation] Started — pump01 ON');
+    return;
+  }
+
+  if (now - startedAt >= intervalMs) {
+    const current = rs.current_pump || 'pump01';
+    const next    = current === 'pump01' ? 'pump02' : 'pump01';
+    const curNum  = current.replace('pump', '');
+    const nxtNum  = next.replace('pump', '');
+
+    // Turn current off, then turn next on after 2 s
+    mqttClient.publish(`pump/${curNum}/cmd`, JSON.stringify({ relay1: 0, relay2: 0 }), { qos: 1 });
+    setTimeout(() => {
+      mqttClient.publish(`pump/${nxtNum}/cmd`, JSON.stringify({ relay1: 1, relay2: 0 }), { qos: 1 });
+    }, 2000);
+
+    db.ref('rotation_schedule').update({ current_pump: next, started_at: now });
+    console.log(`[Rotation] ${current} → ${next}`);
+  }
+}, 60000);
+
+// ─── Schedule execution — check every minute, publish ON/OFF commands ────────
+const schedules = {};
+PUMPS.forEach((pumpId) => {
+  db.ref(`pumps/${pumpId}/schedule`).on('value', (snapshot) => {
+    schedules[pumpId] = snapshot.val();
+  });
+});
+
+setInterval(() => {
+  const now = new Date();
+  const h = now.getHours();
+  const m = now.getMinutes();
+  PUMPS.forEach((pumpId) => {
+    const s = schedules[pumpId];
+    if (!s || !s.enabled) return;
+    const mqttNum = pumpId.replace('pump', '');
+    const cmdTopic = `pump/${mqttNum}/cmd`;
+    if (h === s.on_hour && m === s.on_min) {
+      mqttClient.publish(cmdTopic, JSON.stringify({ relay1: 1, relay2: 0 }), { qos: 1 });
+      console.log(`[Schedule] ${pumpId} → ON (${h}:${String(m).padStart(2,'0')})`);
+    } else if (h === s.off_hour && m === s.off_min) {
+      mqttClient.publish(cmdTopic, JSON.stringify({ relay1: 0, relay2: 0 }), { qos: 1 });
+      console.log(`[Schedule] ${pumpId} → OFF (${h}:${String(m).padStart(2,'0')})`);
+    }
+  });
+}, 60000); // fires every minute
+
+// ─── OTA retry — re-publish every 30 s while pending and no ota_status ──────
+// Root cause: the retained MQTT message is delivered right when the board enters
+// blink_n(3) blocking at subscription time and gets discarded by the flush block.
+// Solution: once the board is in CONNECTED state (no blocking), continuously
+// re-publish as a non-retained message until the board acknowledges.
+const pendingOtaUrl = {};
+
+PUMPS.forEach((pumpId) => {
+  db.ref(`pumps/${pumpId}/ota`).on('value', (snapshot) => {
+    const d = snapshot.val();
+    if (d && d.url) pendingOtaUrl[pumpId] = d.url;
+    else            delete pendingOtaUrl[pumpId];
+  });
+  db.ref(`pumps/${pumpId}/ota_status`).on('value', (snapshot) => {
+    if (snapshot.exists()) delete pendingOtaUrl[pumpId]; // board acknowledged
+  });
+});
+
+setInterval(() => {
+  Object.entries(pendingOtaUrl).forEach(([pumpId, url]) => {
+    const mqttNum = pumpId.replace('pump', '');
+    const topic   = `pump/${mqttNum}/ota`;
+    mqttClient.publish(topic, JSON.stringify({ url }), { qos: 1, retain: false }, (err) => {
+      if (err) console.error(`[OTA] Retry error on ${topic}:`, err.message);
+      else     console.log(`[OTA] Retry publish → ${topic}:`, url);
+    });
+  });
+}, 30000);
 
 // ─── Offline detection — mark pump offline if no status for 30 s ─────────────
 setInterval(() => {
