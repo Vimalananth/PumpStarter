@@ -222,37 +222,6 @@ setInterval(() => {
   });
 }, 60000); // fires every minute
 
-// ─── OTA retry — re-publish every 30 s while pending and no ota_status ──────
-// Root cause: the retained MQTT message is delivered right when the board enters
-// blink_n(3) blocking at subscription time and gets discarded by the flush block.
-// Solution: once the board is in CONNECTED state (no blocking), continuously
-// re-publish as a non-retained message until the board acknowledges.
-const pendingOtaUrl = {};
-
-PUMPS.forEach((pumpId) => {
-  db.ref(`pumps/${pumpId}/ota`).on('value', (snapshot) => {
-    const d = snapshot.val();
-    console.log(`[OTA] ota listener: ${pumpId} =`, JSON.stringify(d));
-    if (d && d.url) pendingOtaUrl[pumpId] = d.url;
-    else            delete pendingOtaUrl[pumpId];
-  });
-  db.ref(`pumps/${pumpId}/ota_status`).on('value', (snapshot) => {
-    console.log(`[OTA] ota_status listener: ${pumpId} exists=${snapshot.exists()}`);
-    if (snapshot.exists()) delete pendingOtaUrl[pumpId]; // board acknowledged
-  });
-});
-
-setInterval(() => {
-  console.log('[OTA] Retry tick, pending:', JSON.stringify(pendingOtaUrl));
-  Object.entries(pendingOtaUrl).forEach(([pumpId, url]) => {
-    const mqttNum = pumpId.replace('pump', '');
-    const topic   = `pump/${mqttNum}/ota`;
-    mqttClient.publish(topic, JSON.stringify({ url }), { qos: 1, retain: false }, (err) => {
-      if (err) console.error(`[OTA] Retry error on ${topic}:`, err.message);
-      else     console.log(`[OTA] Retry publish -> ${topic}:`, url);
-    });
-  });
-}, 30000);
 
 // ─── Offline detection — mark pump offline if no status for 30 s ─────────────
 setInterval(() => {
