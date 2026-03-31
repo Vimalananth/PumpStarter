@@ -113,10 +113,13 @@ PUMPS.forEach((pumpId) => {
     const cmd = snapshot.val();
     if (!cmd) return;
 
-    const payload = JSON.stringify({
-      relay1: cmd.relay1 ?? 0,
-      relay2: cmd.relay2 ?? 0
-    });
+    // Only forward fields that are present — missing fields must NOT default to 0
+    // (would pulse the wrong coil on a latching relay).
+    const out = {};
+    if (cmd.relay1 !== undefined) out.relay1 = cmd.relay1;
+    if (cmd.relay2 !== undefined) out.relay2 = cmd.relay2;
+    if (Object.keys(out).length === 0) return;
+    const payload = JSON.stringify(out);
 
     mqttClient.publish(cmdTopic, payload, { qos: 1 }, (err) => {
       if (err) console.error(`[MQTT] Publish error on ${cmdTopic}:`, err.message);
