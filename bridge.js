@@ -3,6 +3,9 @@
 
 const mqtt  = require('mqtt');
 const admin = require('firebase-admin');
+const http  = require('http');
+const fs    = require('fs');
+const path  = require('path');
 
 // ─── Firebase init ────────────────────────────────────────────────────────────
 // On Railway: set FIREBASE_SERVICE_ACCOUNT env var to the full JSON content
@@ -236,5 +239,31 @@ setInterval(() => {
     }
   });
 }, 15000);
+
+// ─── Firmware file server — serves firmware.bin with no redirect ─────────────
+// Railway injects PORT; EC200U downloads from https://<railway-host>/firmware.bin
+// Place firmware.bin in the same folder as bridge.js, then redeploy.
+const PORT          = process.env.PORT || 3000;
+const FIRMWARE_FILE = path.join(__dirname, 'firmware.bin');
+
+const fileServer = http.createServer((req, res) => {
+  if (req.url !== '/firmware.bin') {
+    res.writeHead(404); res.end('Not found'); return;
+  }
+  if (!fs.existsSync(FIRMWARE_FILE)) {
+    res.writeHead(503); res.end('firmware.bin not present'); return;
+  }
+  const stat = fs.statSync(FIRMWARE_FILE);
+  res.writeHead(200, {
+    'Content-Type':        'application/octet-stream',
+    'Content-Length':      stat.size,
+    'Content-Disposition': 'attachment; filename="firmware.bin"'
+  });
+  fs.createReadStream(FIRMWARE_FILE).pipe(res);
+  console.log(`[HTTP] Served firmware.bin (${stat.size} bytes)`);
+});
+
+fileServer.listen(PORT, () =>
+  console.log(`[HTTP] Firmware server on port ${PORT} — firmware.bin ${fs.existsSync(FIRMWARE_FILE) ? 'ready' : 'MISSING'}`));
 
 console.log('[Bridge] Running. Waiting for MQTT connection...');
