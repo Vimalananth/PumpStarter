@@ -69,6 +69,7 @@ const lastSeen = { pump01: 0, pump02: 0 };
 
 mqttClient.on('message', (topic, message) => {
   try {
+    console.log(`[MQTT] RX ${topic} (${message.length} bytes)`);
     const payload = JSON.parse(message.toString());
     const { pumpId, type } = topicToFirebase(topic);
     payload.ts = Date.now();
