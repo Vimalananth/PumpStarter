@@ -250,7 +250,8 @@ const PORT          = process.env.PORT || 3000;
 const FIRMWARE_FILE = path.join(__dirname, 'firmware.bin');
 
 const fileServer = http.createServer((req, res) => {
-  if (req.url !== '/firmware.bin') {
+  const reqPath = (req.url || '').split('?')[0];
+  if (reqPath !== '/firmware.bin') {
     res.writeHead(404); res.end('Not found'); return;
   }
   if (!fs.existsSync(FIRMWARE_FILE)) {
@@ -260,8 +261,14 @@ const fileServer = http.createServer((req, res) => {
   res.writeHead(200, {
     'Content-Type':        'application/octet-stream',
     'Content-Length':      stat.size,
-    'Content-Disposition': 'attachment; filename="firmware.bin"'
+    'Content-Disposition': 'attachment; filename="firmware.bin"',
+    'Connection':          'close',
+    'Cache-Control':       'no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0, no-transform',
+    'Pragma':              'no-cache',
+    'Expires':             '0',
+    'Accept-Ranges':       'none'
   });
+  req.socket.setNoDelay(true);
   fs.createReadStream(FIRMWARE_FILE).pipe(res);
   console.log(`[HTTP] Served firmware.bin (${stat.size} bytes)`);
 });
