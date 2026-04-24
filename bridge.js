@@ -163,6 +163,30 @@ PUMPS.forEach((pumpId) => {
   });
 
   console.log(`[FB] Listening for OTA commands on ${otaFbPath}`);
+
+  // Firebase → MQTT protection settings
+  // Flutter writes {ov,uv,pl,dry_i,dry_t} to pumps/pump01/settings
+  // Bridge publishes as retained MQTT so device receives settings on every reconnect
+  const settingsFbPath   = `pumps/${pumpId}/settings`;
+  const settingsMqttTopic = `pump/${mqttNum}/settings`;
+
+  db.ref(settingsFbPath).on('value', (snapshot) => {
+    const s = snapshot.val();
+    if (!s) return;
+    const payload = JSON.stringify({
+      ov:    s.ov    ?? 480,
+      uv:    s.uv    ?? 340,
+      pl:    s.pl    ?? 200,
+      dry_i: s.dry_i ?? 1.5,
+      dry_t: s.dry_t ?? 8
+    });
+    mqttClient.publish(settingsMqttTopic, payload, { qos: 1, retain: true }, (err) => {
+      if (err) console.error(`[MQTT] Settings publish error on ${settingsMqttTopic}:`, err.message);
+      else     console.log(`[FB→MQTT] Settings → ${settingsMqttTopic}:`, payload);
+    });
+  });
+
+  console.log(`[FB] Listening for settings on ${settingsFbPath}`);
 });
 
 // ─── Rotation schedule — alternate pumps every N minutes ─────────────────────
