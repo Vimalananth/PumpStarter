@@ -41,8 +41,8 @@ const mqttClient = mqtt.connect(BROKER_URL, {
 const PUMPS = ['pump01', 'pump02'];
 
 const TOPICS_SUB = [
-  'pump/01/status', 'pump/01/alerts', 'pump/01/ota/status',
-  'pump/02/status', 'pump/02/alerts', 'pump/02/ota/status'
+  'pump/01/status', 'pump/01/alerts', 'pump/01/ota/status', 'pump/01/log',
+  'pump/02/status', 'pump/02/alerts', 'pump/02/ota/status', 'pump/02/log'
 ];
 
 // pump/01/status        ->  { pumpId: 'pump01', type: 'status' }
@@ -86,6 +86,14 @@ mqttClient.on('message', (topic, message) => {
       const otaTopic = `pump/${mqttNum}/ota`;
       mqttClient.publish(otaTopic, '', { qos: 1, retain: true },
         () => console.log(`[MQTT] Cleared retained OTA on ${otaTopic}`));
+      return;
+    }
+
+    if (type === 'log') {
+      // Use push() so each log entry gets a unique time-sorted key
+      db.ref(`pumps/${pumpId}/logs`).push(payload)
+        .then(()  => console.log(`[FB] Log pushed pumps/${pumpId}/logs: ${payload.event}/${payload.reason}`))
+        .catch(err => console.error('[FB] Log push error:', err.message));
       return;
     }
 
@@ -173,13 +181,16 @@ PUMPS.forEach((pumpId) => {
   db.ref(settingsFbPath).on('value', (snapshot) => {
     const s = snapshot.val();
     if (!s) return;
-    const payload = JSON.stringify({
-      ov:    s.ov    ?? 480,
-      uv:    s.uv    ?? 340,
-      pl:    s.pl    ?? 200,
-      dry_i: s.dry_i ?? 1.5,
-      dry_t: s.dry_t ?? 8
-    });
+    const out = {
+      ov:     s.ov     ?? 480,
+      uv:     s.uv     ?? 340,
+      pl:     s.pl     ?? 200,
+      dry_i:  s.dry_i  ?? 1.5,
+      dry_t:  s.dry_t  ?? 8,
+      dry_en: s.dry_en ?? 1,
+    };
+    if (s.hp != null) out.hp = s.hp;
+    const payload = JSON.stringify(out);
     mqttClient.publish(settingsMqttTopic, payload, { qos: 1, retain: true }, (err) => {
       if (err) console.error(`[MQTT] Settings publish error on ${settingsMqttTopic}:`, err.message);
       else     console.log(`[FB→MQTT] Settings → ${settingsMqttTopic}:`, payload);
@@ -205,7 +216,7 @@ setInterval(() => {
 
   if (startedAt === 0) {
     // First run — start Pump 1 now
-    mqttClient.publish('pump/01/cmd', JSON.stringify({ relay1: 1, relay2: 0 }), { qos: 1 });
+    mqttClient.publish('pump/01/cmd', JSON.stringify({ relay1: 1, src: 'rot' }), { qos: 1 });
     db.ref('rotation_schedule').update({ current_pump: 'pump01', started_at: now });
     console.log('[Rotation] Started — pump01 ON');
     return;
@@ -218,9 +229,9 @@ setInterval(() => {
     const nxtNum  = next.replace('pump', '');
 
     // Turn current off, then turn next on after 2 s
-    mqttClient.publish(`pump/${curNum}/cmd`, JSON.stringify({ relay1: 0, relay2: 0 }), { qos: 1 });
+    mqttClient.publish(`pump/${curNum}/cmd`, JSON.stringify({ relay1: 0, src: 'rot' }), { qos: 1 });
     setTimeout(() => {
-      mqttClient.publish(`pump/${nxtNum}/cmd`, JSON.stringify({ relay1: 1, relay2: 0 }), { qos: 1 });
+      mqttClient.publish(`pump/${nxtNum}/cmd`, JSON.stringify({ relay1: 1, src: 'rot' }), { qos: 1 });
     }, 2000);
 
     db.ref('rotation_schedule').update({ current_pump: next, started_at: now });
@@ -246,10 +257,10 @@ setInterval(() => {
     const mqttNum = pumpId.replace('pump', '');
     const cmdTopic = `pump/${mqttNum}/cmd`;
     if (h === s.on_hour && m === s.on_min) {
-      mqttClient.publish(cmdTopic, JSON.stringify({ relay1: 1, relay2: 0 }), { qos: 1 });
+      mqttClient.publish(cmdTopic, JSON.stringify({ relay1: 1, src: 'sched' }), { qos: 1 });
       console.log(`[Schedule] ${pumpId} → ON (${h}:${String(m).padStart(2,'0')})`);
     } else if (h === s.off_hour && m === s.off_min) {
-      mqttClient.publish(cmdTopic, JSON.stringify({ relay1: 0, relay2: 0 }), { qos: 1 });
+      mqttClient.publish(cmdTopic, JSON.stringify({ relay1: 0, src: 'sched' }), { qos: 1 });
       console.log(`[Schedule] ${pumpId} → OFF (${h}:${String(m).padStart(2,'0')})`);
     }
   });
