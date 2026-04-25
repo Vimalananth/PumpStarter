@@ -200,43 +200,55 @@ PUMPS.forEach((pumpId) => {
   console.log(`[FB] Listening for settings on ${settingsFbPath}`);
 });
 
-// ─── Rotation schedule — alternate pumps every N minutes ─────────────────────
-let rotationSchedule = null;
-db.ref('rotation_schedule').on('value', (snapshot) => {
-  rotationSchedule = snapshot.val();
+// ─── Rotation schedule — per-site, alternate pumps every N minutes ────────────
+const SITE_CONFIGS = [
+  { id: 'site01', pumps: ['pump01', 'pump02'] },
+  // { id: 'site02', pumps: ['pump03', 'pump04'] },  // future
+];
+
+const rotationSchedules = {};
+SITE_CONFIGS.forEach(({ id }) => {
+  db.ref(`sites/${id}/rotation_schedule`).on('value', (snap) => {
+    rotationSchedules[id] = snap.val();
+  });
+  console.log(`[FB] Listening for rotation on sites/${id}/rotation_schedule`);
 });
 
 setInterval(() => {
-  const rs = rotationSchedule;
-  if (!rs || !rs.enabled) return;
+  SITE_CONFIGS.forEach(({ id, pumps }) => {
+    const rs = rotationSchedules[id];
+    if (!rs || !rs.enabled) return;
 
-  const now        = Date.now();
-  const intervalMs = (rs.interval_minutes || 240) * 60 * 1000;
-  const startedAt  = rs.started_at || 0;
+    const now        = Date.now();
+    const intervalMs = (rs.interval_minutes || 240) * 60 * 1000;
+    const startedAt  = rs.started_at || 0;
+    const pump1 = pumps[0];
+    const pump2 = pumps[1];
 
-  if (startedAt === 0) {
-    // First run — start Pump 1 now
-    mqttClient.publish('pump/01/cmd', JSON.stringify({ relay1: 1, src: 'rot' }), { qos: 1 });
-    db.ref('rotation_schedule').update({ current_pump: 'pump01', started_at: now });
-    console.log('[Rotation] Started — pump01 ON');
-    return;
-  }
+    if (startedAt === 0) {
+      const p1Num = pump1.replace('pump', '');
+      mqttClient.publish(`pump/${p1Num}/cmd`, JSON.stringify({ relay1: 1, src: 'rot' }), { qos: 1 });
+      db.ref(`sites/${id}/rotation_schedule`).update({ current_pump: pump1, started_at: now });
+      console.log(`[Rotation:${id}] Started — ${pump1} ON`);
+      return;
+    }
 
-  if (now - startedAt >= intervalMs) {
-    const current = rs.current_pump || 'pump01';
-    const next    = current === 'pump01' ? 'pump02' : 'pump01';
-    const curNum  = current.replace('pump', '');
-    const nxtNum  = next.replace('pump', '');
+    if (now - startedAt >= intervalMs) {
+      const current = rs.current_pump || pump1;
+      const next    = current === pump1 ? pump2 : pump1;
+      const curNum  = current.replace('pump', '');
+      const nxtNum  = next.replace('pump', '');
 
-    // Turn current off, then turn next on after 2 s
-    mqttClient.publish(`pump/${curNum}/cmd`, JSON.stringify({ relay1: 0, src: 'rot' }), { qos: 1 });
-    setTimeout(() => {
-      mqttClient.publish(`pump/${nxtNum}/cmd`, JSON.stringify({ relay1: 1, src: 'rot' }), { qos: 1 });
-    }, 2000);
+      // Turn current off, then turn next on after 2 s
+      mqttClient.publish(`pump/${curNum}/cmd`, JSON.stringify({ relay1: 0, src: 'rot' }), { qos: 1 });
+      setTimeout(() => {
+        mqttClient.publish(`pump/${nxtNum}/cmd`, JSON.stringify({ relay1: 1, src: 'rot' }), { qos: 1 });
+      }, 2000);
 
-    db.ref('rotation_schedule').update({ current_pump: next, started_at: now });
-    console.log(`[Rotation] ${current} → ${next}`);
-  }
+      db.ref(`sites/${id}/rotation_schedule`).update({ current_pump: next, started_at: now });
+      console.log(`[Rotation:${id}] ${current} → ${next}`);
+    }
+  });
 }, 60000);
 
 // ─── Schedule execution — check every minute, publish ON/OFF commands ────────
