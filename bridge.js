@@ -27,12 +27,14 @@ admin.initializeApp({
 });
 const db = admin.database();
 
-// ─── broker.emqx.io connection (anonymous public TLS) ────────────────────────
-const BROKER_URL = 'mqtts://broker.emqx.io:8883';
+// ─── EMQX Cloud connection (authenticated TLS) ───────────────────────────────
+const BROKER_URL = 'mqtts://z9c698f0.ala.asia-southeast1.emqxsl.com:8883';
 
 const mqttClient = mqtt.connect(BROKER_URL, {
   clientId:          'bridge_node_' + Math.random().toString(16).slice(2, 8),
-  rejectUnauthorized: false,
+  username:          'bridge',
+  password:          'Light@2026',
+  rejectUnauthorized: true,
   keepalive:         60,
   reconnectPeriod:   3000
 });
@@ -54,7 +56,7 @@ function topicToFirebase(topic) {
 
 // ─── MQTT events ──────────────────────────────────────────────────────────────
 mqttClient.on('connect', () => {
-  console.log('[MQTT] Connected to broker.emqx.io');
+  console.log('[MQTT] Connected to EMQX Cloud');
   mqttClient.subscribe(TOPICS_SUB, { qos: 1 }, (err) => {
     if (err) console.error('[MQTT] Subscribe error:', err);
     else     console.log('[MQTT] Subscribed to:', TOPICS_SUB);
