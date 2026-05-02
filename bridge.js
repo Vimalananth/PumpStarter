@@ -38,11 +38,13 @@ const mqttClient = mqtt.connect(BROKER_URL, {
 });
 
 // ─── Topics ───────────────────────────────────────────────────────────────────
-const PUMPS = ['pump01', 'pump02'];
+const PUMPS = ['pump01', 'pump02', 'pump03', 'pump04'];
 
 const TOPICS_SUB = [
   'pump/01/status', 'pump/01/alerts', 'pump/01/ota/status', 'pump/01/log',
-  'pump/02/status', 'pump/02/alerts', 'pump/02/ota/status', 'pump/02/log'
+  'pump/02/status', 'pump/02/alerts', 'pump/02/ota/status', 'pump/02/log',
+  'pump/03/status', 'pump/03/alerts', 'pump/03/ota/status', 'pump/03/log',
+  'pump/04/status', 'pump/04/alerts', 'pump/04/ota/status', 'pump/04/log'
 ];
 
 // pump/01/status        ->  { pumpId: 'pump01', type: 'status' }
