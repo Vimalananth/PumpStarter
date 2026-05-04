@@ -67,7 +67,7 @@ mqttClient.on('reconnect', () => console.log('[MQTT] Reconnecting...'));
 mqttClient.on('error',     (err) => console.error('[MQTT] Error:', err.message));
 
 // ─── EC200U publishes status/alerts → write to Firebase ──────────────────────
-const lastSeen = { pump01: 0, pump02: 0 };
+const lastSeen = { pump01: 0, pump02: 0, pump03: 0, pump04: 0 };
 
 mqttClient.on('message', (topic, message) => {
   try {    const payload = JSON.parse(message.toString());
