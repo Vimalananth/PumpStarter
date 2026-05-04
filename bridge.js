@@ -183,6 +183,13 @@ PUMPS.forEach((pumpId) => {
   db.ref(settingsFbPath).on('value', (snapshot) => {
     const s = snapshot.val();
     if (!s) return;
+    // Validate threshold ordering: OV must be > UV must be > PL
+    if (s.ov !== undefined && s.uv !== undefined && s.pl !== undefined) {
+      if (s.ov <= s.uv || s.uv <= s.pl) {
+        console.error(`[CFG:${pumpId}] Invalid settings rejected — ov(${s.ov}) must be > uv(${s.uv}) must be > pl(${s.pl})`);
+        return;
+      }
+    }
     const out = {
       ov:     s.ov     ?? 480,
       uv:     s.uv     ?? 340,
@@ -205,7 +212,7 @@ PUMPS.forEach((pumpId) => {
 // ─── Rotation schedule — per-site, alternate pumps every N minutes ────────────
 const SITE_CONFIGS = [
   { id: 'site01', pumps: ['pump01', 'pump02'] },
-  // { id: 'site02', pumps: ['pump03', 'pump04'] },  // future
+  { id: 'site02', pumps: ['pump03', 'pump04'] },
 ];
 
 const rotationSchedules = {};
