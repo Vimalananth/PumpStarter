@@ -139,8 +139,12 @@ mqttClient.on('message', (topic, message) => {
       .catch(err => console.error('[FB] Write error:', err.message));
 
     if (type === 'status') {
-      lastSeen[pumpId]        = Date.now();
-      offlineNotified[pumpId] = false; // back online — reset flag
+      lastSeen[pumpId] = Date.now();
+      if (offlineNotified[pumpId]) {
+        // Device just came back — send recovery notification
+        offlineNotified[pumpId] = false;
+        sendFCM(pumpId, `${pumpLabel(pumpId)} — Back Online`, 'Device has reconnected and is sending heartbeats');
+      }
     }
 
     if (type === 'alerts') {
