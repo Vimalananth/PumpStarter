@@ -66,8 +66,33 @@ mqttClient.on('connect', () => {
 mqttClient.on('reconnect', () => console.log('[MQTT] Reconnecting...'));
 mqttClient.on('error',     (err) => console.error('[MQTT] Error:', err.message));
 
+// ─── FCM helpers ─────────────────────────────────────────────────────────────
+function pumpLabel(pumpId) {
+  return `Pump ${parseInt(pumpId.replace('pump', ''), 10)}`;
+}
+
+function fmtRunTime(s) {
+  if (s < 60)   return `${s}s`;
+  if (s < 3600) return `${Math.floor(s / 60)}m ${s % 60}s`;
+  return `${Math.floor(s / 3600)}h ${Math.floor((s % 3600) / 60)}m`;
+}
+
+async function sendFCM(topic, title, body) {
+  try {
+    await admin.messaging().send({
+      topic,
+      notification: { title, body },
+      android: { priority: 'high', notification: { channelId: 'pump_alerts' } },
+    });
+    console.log(`[FCM] → ${topic}: ${title}`);
+  } catch (e) {
+    console.error('[FCM] Error:', e.message);
+  }
+}
+
 // ─── EC200U publishes status/alerts → write to Firebase ──────────────────────
-const lastSeen = { pump01: 0, pump02: 0, pump03: 0, pump04: 0 };
+const lastSeen        = { pump01: 0, pump02: 0, pump03: 0, pump04: 0 };
+const offlineNotified = { pump01: false, pump02: false, pump03: false, pump04: false };
 
 mqttClient.on('message', (topic, message) => {
   try {    const payload = JSON.parse(message.toString());
@@ -96,6 +121,16 @@ mqttClient.on('message', (topic, message) => {
       db.ref(`pumps/${pumpId}/logs`).push(payload)
         .then(()  => console.log(`[FB] Log pushed pumps/${pumpId}/logs: ${payload.event}/${payload.reason}`))
         .catch(err => console.error('[FB] Log push error:', err.message));
+      // Notify ON / OFF events
+      const label = pumpLabel(pumpId);
+      if (payload.event === 'on') {
+        const src = payload.reason || 'manual';
+        sendFCM(pumpId, `${label} Started`, `Turned ON (${src})`);
+      } else if (payload.event === 'off') {
+        const src     = payload.reason || 'manual';
+        const runStr  = payload.run_s ? ` — ran ${fmtRunTime(payload.run_s)}` : '';
+        sendFCM(pumpId, `${label} Stopped`, `Turned OFF (${src})${runStr}`);
+      }
       return;
     }
 
@@ -104,7 +139,16 @@ mqttClient.on('message', (topic, message) => {
       .catch(err => console.error('[FB] Write error:', err.message));
 
     if (type === 'status') {
-      lastSeen[pumpId] = Date.now();
+      lastSeen[pumpId]        = Date.now();
+      offlineNotified[pumpId] = false; // back online — reset flag
+    }
+
+    if (type === 'alerts') {
+      const label = pumpLabel(pumpId);
+      if (payload.dry_run_trip) sendFCM(pumpId, `${label} — Dry Run Trip`,  'Pump tripped: no water detected');
+      if (payload.overvoltage)  sendFCM(pumpId, `${label} — Overvoltage`,   'Pump tripped: voltage too high');
+      if (payload.undervoltage) sendFCM(pumpId, `${label} — Undervoltage`,  'Pump tripped: voltage too low');
+      if (payload.phase_loss)   sendFCM(pumpId, `${label} — Phase Loss`,    'Pump tripped: phase loss detected');
     }
   } catch (e) {
     console.error('[MQTT] Parse error:', e.message, '| raw:', message.toString());
@@ -293,8 +337,11 @@ setInterval(() => {
   const now = Date.now();
   PUMPS.forEach((pumpId) => {
     if (lastSeen[pumpId] && now - lastSeen[pumpId] > 30000) {
-      db.ref(`pumps/${pumpId}/status/online`).set(false)
-        .catch(() => {});
+      db.ref(`pumps/${pumpId}/status/online`).set(false).catch(() => {});
+      if (!offlineNotified[pumpId]) {
+        offlineNotified[pumpId] = true;
+        sendFCM(pumpId, `${pumpLabel(pumpId)} — Offline`, 'Device has stopped sending heartbeats');
+      }
     }
   });
 }, 15000);
