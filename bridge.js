@@ -94,6 +94,30 @@ async function sendFCM(topic, title, body) {
 const lastSeen        = { pump01: 0, pump02: 0, pump03: 0, pump04: 0 };
 const offlineNotified = { pump01: false, pump02: false, pump03: false, pump04: false };
 
+// ─── Voltage / current sampler — one entry per 15 min, kept for 5 days ───────
+const VOLTAGE_LOG_INTERVAL_MS = 15 * 60 * 1000;          // 15 minutes
+const VOLTAGE_LOG_RETAIN_MS   = 5 * 24 * 60 * 60 * 1000; // 5 days
+const lastVoltageLog = { pump01: 0, pump02: 0, pump03: 0, pump04: 0 };
+
+function maybeLogVoltage(pumpId, payload) {
+  const now = Date.now();
+  if (now - lastVoltageLog[pumpId] < VOLTAGE_LOG_INTERVAL_MS) return;
+  lastVoltageLog[pumpId] = now;
+
+  const v1 = payload.v1, v2 = payload.v2, v3 = payload.v3;
+  const current = payload.current;
+  if (!v1 && !v2 && !v3) return; // skip if no real sensor data
+
+  db.ref(`pumps/${pumpId}/voltage_log`).push({ ts: now, v1, v2, v3, current })
+    .then(() => console.log(`[VLog] ${pumpId} v1=${v1} v2=${v2} v3=${v3} i=${current}A`))
+    .catch(err => console.error('[VLog] Write error:', err.message));
+
+  // Purge entries older than 5 days
+  db.ref(`pumps/${pumpId}/voltage_log`).orderByChild('ts')
+    .endAt(now - VOLTAGE_LOG_RETAIN_MS)
+    .once('value', snap => snap.forEach(child => child.ref.remove()));
+}
+
 mqttClient.on('message', (topic, message) => {
   try {    const payload = JSON.parse(message.toString());
     const { pumpId, type } = topicToFirebase(topic);
@@ -145,6 +169,7 @@ mqttClient.on('message', (topic, message) => {
         offlineNotified[pumpId] = false;
         sendFCM(pumpId, `${pumpLabel(pumpId)} — Back Online`, 'Device has reconnected and is sending heartbeats');
       }
+      maybeLogVoltage(pumpId, payload);
     }
 
     if (type === 'alerts') {
