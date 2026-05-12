@@ -382,21 +382,18 @@ setInterval(() => {
 // Railway injects PORT; EC200U downloads from https://<railway-host>/firmware.bin
 // Place firmware.bin in the same folder as bridge.js, then redeploy.
 const PORT          = process.env.PORT || 3000;
-const FIRMWARE_FILE = path.join(__dirname, 'firmware.bin');
+const FIRMWARE_FILE      = path.join(__dirname, 'firmware.bin');
+const FIRMWARE_TEST_FILE = path.join(__dirname, 'firmware_test.bin');
 
-const fileServer = http.createServer((req, res) => {
-  const reqPath = (req.url || '').split('?')[0];
-  if (reqPath !== '/firmware.bin') {
-    res.writeHead(404); res.end('Not found'); return;
+function serveFirmware(req, res, filePath, fileName) {
+  if (!fs.existsSync(filePath)) {
+    res.writeHead(503); res.end(`${fileName} not present`); return;
   }
-  if (!fs.existsSync(FIRMWARE_FILE)) {
-    res.writeHead(503); res.end('firmware.bin not present'); return;
-  }
-  const stat = fs.statSync(FIRMWARE_FILE);
+  const stat = fs.statSync(filePath);
   res.writeHead(200, {
     'Content-Type':        'application/octet-stream',
     'Content-Length':      stat.size,
-    'Content-Disposition': 'attachment; filename="firmware.bin"',
+    'Content-Disposition': `attachment; filename="${fileName}"`,
     'Connection':          'close',
     'Cache-Control':       'no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0, no-transform',
     'Pragma':              'no-cache',
@@ -404,8 +401,19 @@ const fileServer = http.createServer((req, res) => {
     'Accept-Ranges':       'none'
   });
   req.socket.setNoDelay(true);
-  fs.createReadStream(FIRMWARE_FILE).pipe(res);
-  console.log(`[HTTP] Served firmware.bin (${stat.size} bytes)`);
+  fs.createReadStream(filePath).pipe(res);
+  console.log(`[HTTP] Served ${fileName} (${stat.size} bytes)`);
+}
+
+const fileServer = http.createServer((req, res) => {
+  const reqPath = (req.url || '').split('?')[0];
+  if (reqPath === '/firmware.bin') {
+    serveFirmware(req, res, FIRMWARE_FILE, 'firmware.bin');
+  } else if (reqPath === '/firmware_test.bin') {
+    serveFirmware(req, res, FIRMWARE_TEST_FILE, 'firmware_test.bin');
+  } else {
+    res.writeHead(404); res.end('Not found');
+  }
 });
 
 fileServer.listen(PORT, () =>
