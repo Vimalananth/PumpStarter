@@ -361,11 +361,14 @@ setInterval(() => {
 }, 60000); // fires every minute
 
 
-// ─── Offline detection — mark pump offline if no status for 30 s ─────────────
+// ─── Offline detection — mark pump offline if no status for 90 s ─────────────
+// pump02 heartbeat fires every 60 s (firmware); 90 s gives a safe margin.
+// Once firmware is updated via OTA to publish status2 every 10 s, this can
+// be tightened back to 30 s.
 setInterval(() => {
   const now = Date.now();
   PUMPS.forEach((pumpId) => {
-    if (lastSeen[pumpId] && now - lastSeen[pumpId] > 30000) {
+    if (lastSeen[pumpId] && now - lastSeen[pumpId] > 90000) {
       db.ref(`pumps/${pumpId}/status/online`).set(false).catch(() => {});
       if (!offlineNotified[pumpId]) {
         offlineNotified[pumpId] = true;
