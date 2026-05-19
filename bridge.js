@@ -91,7 +91,7 @@ async function sendFCM(topic, title, body) {
 }
 
 // ─── EC200U publishes status/alerts → write to Firebase ──────────────────────
-const lastSeen        = { pump01: 0, pump02: 0, pump03: 0, pump04: 0 };
+const lastSeen        = { pump01: Date.now(), pump02: Date.now(), pump03: Date.now(), pump04: Date.now() };
 const offlineNotified = { pump01: false, pump02: false, pump03: false, pump04: false };
 
 // ─── Voltage / current sampler — one entry per 15 min, kept for 5 days ───────
