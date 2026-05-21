@@ -208,6 +208,8 @@ PUMPS.forEach((pumpId) => {
     const out = {};
     if (cmd.relay1 !== undefined) out.relay1 = cmd.relay1;
     if (cmd.relay2 !== undefined) out.relay2 = cmd.relay2;
+    if (cmd.relay3 !== undefined) out.relay3 = cmd.relay3;
+    if (cmd.relay4 !== undefined) out.relay4 = cmd.relay4;
     if (Object.keys(out).length === 0) return;
     const payload = JSON.stringify(out);
 
