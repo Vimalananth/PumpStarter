@@ -195,6 +195,7 @@ PUMPS.forEach((pumpId) => {
   let initialized = false;
 
   db.ref(fbPath).on('value', (snapshot) => {
+    console.log(`[CMD DBG] ${pumpId} fired init=${initialized} val=${JSON.stringify(snapshot.val())}`);
     if (!initialized) {
       initialized = true;
       return; // skip initial read on startup — only forward new writes
