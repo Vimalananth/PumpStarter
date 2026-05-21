@@ -106,10 +106,11 @@ function maybeLogVoltage(pumpId, payload) {
 
   const v1 = payload.v1, v2 = payload.v2, v3 = payload.v3;
   const current = payload.current;
+  const kw      = payload.kw ?? 0;
   if (!v1 && !v2 && !v3) return; // skip if no real sensor data
 
-  db.ref(`pumps/${pumpId}/voltage_log`).push({ ts: now, v1, v2, v3, current })
-    .then(() => console.log(`[VLog] ${pumpId} v1=${v1} v2=${v2} v3=${v3} i=${current}A`))
+  db.ref(`pumps/${pumpId}/voltage_log`).push({ ts: now, v1, v2, v3, current, kw })
+    .then(() => console.log(`[VLog] ${pumpId} v1=${v1} v2=${v2} v3=${v3} i=${current}A kw=${kw}kW`))
     .catch(err => console.error('[VLog] Write error:', err.message));
 
   // Purge entries older than 5 days
