@@ -122,7 +122,7 @@ function maybeLogVoltage(pumpId, payload) {
 mqttClient.on('message', (topic, message) => {
   try {    const payload = JSON.parse(message.toString());
     const { pumpId, type } = topicToFirebase(topic);
-    payload.ts = Date.now();
+    if (!payload.ts) payload.ts = Date.now(); /* use device ts if present, else stamp here */
 
     if (type === 'ota/status') {
       // OTA progress/result — write to pumps/pump01/ota_status
