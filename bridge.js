@@ -205,9 +205,16 @@ PUMPS.forEach((pumpId) => {
 
     // Only forward fields that are present — missing fields must NOT default to 0
     // (would pulse the wrong coil on a latching relay).
+    // pump03/04: relay1/relay2 are remapped to relay3/relay4 so the device
+    // forwards them via LoRa to the Blue Pill slave (test setup).
     const out = {};
-    if (cmd.relay1 !== undefined) out.relay1 = cmd.relay1;
-    if (cmd.relay2 !== undefined) out.relay2 = cmd.relay2;
+    if (pumpId === 'pump03' || pumpId === 'pump04') {
+      if (cmd.relay1 !== undefined) out.relay3 = cmd.relay1;
+      if (cmd.relay2 !== undefined) out.relay4 = cmd.relay2;
+    } else {
+      if (cmd.relay1 !== undefined) out.relay1 = cmd.relay1;
+      if (cmd.relay2 !== undefined) out.relay2 = cmd.relay2;
+    }
     if (cmd.relay3 !== undefined) out.relay3 = cmd.relay3;
     if (cmd.relay4 !== undefined) out.relay4 = cmd.relay4;
     if (Object.keys(out).length === 0) return;
