@@ -43,7 +43,7 @@ const PUMPS = ['pump01', 'pump02', 'pump03', 'pump04'];
 const TOPICS_SUB = [
   'pump/01/status', 'pump/01/alerts', 'pump/01/ota/status', 'pump/01/log',
   'pump/02/status', 'pump/02/alerts', 'pump/02/ota/status', 'pump/02/log',
-  'pump/03/status', 'pump/03/alerts', 'pump/03/ota/status', 'pump/03/log',
+  'pump/03/status', 'pump/03/alerts', 'pump/03/ota/status', 'pump/03/log', 'pump/03/slave_log',
   'pump/04/status', 'pump/04/alerts', 'pump/04/ota/status', 'pump/04/log'
 ];
 
@@ -138,6 +138,19 @@ mqttClient.on('message', (topic, message) => {
       const otaTopic = `pump/${mqttNum}/ota`;
       mqttClient.publish(otaTopic, '', { qos: 1, retain: true },
         () => console.log(`[MQTT] Cleared retained OTA on ${otaTopic}`));
+      return;
+    }
+
+    if (type === 'slave_log') {
+      // LoRa slave heartbeat — pushed to pumps/pump03/slave_log (2-day rolling window)
+      const SLAVE_LOG_RETAIN_MS = 2 * 24 * 60 * 60 * 1000;
+      db.ref(`pumps/${pumpId}/slave_log`).push(payload)
+        .then(() => console.log(`[FB] SlaveLog ${pumpId} r3=${payload.r3} r4=${payload.r4} rssi=${payload.rssi} age_s=${payload.age_s}`))
+        .catch(err => console.error('[FB] SlaveLog push error:', err.message));
+      // Purge entries older than 2 days
+      const cutoff = (payload.ts || Date.now()) - SLAVE_LOG_RETAIN_MS;
+      db.ref(`pumps/${pumpId}/slave_log`).orderByChild('ts').endAt(cutoff)
+        .once('value', snap => snap.forEach(child => child.ref.remove()));
       return;
     }
 
