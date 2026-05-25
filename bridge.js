@@ -54,12 +54,24 @@ function topicToFirebase(topic) {
   return { pumpId: 'pump' + parts[1], type: parts.slice(2).join('/') };
 }
 
+// ─── Latest settings cache — re-published on every MQTT connect ───────────────
+// Public brokers (broker.emqx.io) do not persist retained messages across
+// restarts.  On reconnect we re-push all cached settings payloads so the
+// device always receives correct settings after a broker or bridge restart.
+const latestSettingsPayload = {};
+
 // ─── MQTT events ──────────────────────────────────────────────────────────────
 mqttClient.on('connect', () => {
   console.log('[MQTT] Connected to broker.emqx.io');
   mqttClient.subscribe(TOPICS_SUB, { qos: 1 }, (err) => {
     if (err) console.error('[MQTT] Subscribe error:', err);
     else     console.log('[MQTT] Subscribed to:', TOPICS_SUB);
+  });
+  // Re-publish all cached settings as retained so broker state is restored
+  // after a broker restart (which wipes its retained message store).
+  Object.values(latestSettingsPayload).forEach(({ topic, payload }) => {
+    mqttClient.publish(topic, payload, { qos: 1, retain: true },
+      () => console.log(`[CFG] Re-published settings on connect → ${topic}`));
   });
 });
 
@@ -94,8 +106,8 @@ async function sendFCM(topic, title, body) {
 const lastSeen        = { pump01: Date.now(), pump02: Date.now(), pump03: Date.now(), pump04: Date.now() };
 const offlineNotified = { pump01: false, pump02: false, pump03: false, pump04: false };
 
-// ─── Voltage / current sampler — one entry per 15 min, kept for 5 days ───────
-const VOLTAGE_LOG_INTERVAL_MS = 15 * 60 * 1000;          // 15 minutes
+// ─── Voltage / current sampler — one entry per 5 min, kept for 5 days ────────
+const VOLTAGE_LOG_INTERVAL_MS = 5 * 60 * 1000;           // 5 minutes
 const VOLTAGE_LOG_RETAIN_MS   = 5 * 24 * 60 * 60 * 1000; // 5 days
 const lastVoltageLog = { pump01: 0, pump02: 0, pump03: 0, pump04: 0 };
 
@@ -270,6 +282,31 @@ PUMPS.forEach((pumpId) => {
 
   console.log(`[FB] Listening for OTA commands on ${otaFbPath}`);
 
+  // Firebase → MQTT LoRa OTA trigger (pump03 only)
+  // Flutter app writes {url: "https://..."} to pumps/pump03/lora_ota_cmd
+  // Bridge forwards it as MQTT to pump/03/lora_ota so EC200U starts LoRa OTA
+  if (pumpId === 'pump03') {
+    const loraOtaFbPath   = `pumps/${pumpId}/lora_ota_cmd`;
+    const loraOtaMqttTopic = `pump/${mqttNum}/lora_ota`;
+    let loraOtaInitialized = false;
+
+    db.ref(loraOtaFbPath).on('value', (snapshot) => {
+      if (!loraOtaInitialized) {
+        loraOtaInitialized = true;
+        return; // skip initial read — only forward new writes
+      }
+      const cmd = snapshot.val();
+      if (!cmd || !cmd.url) return;
+
+      const payload = JSON.stringify({ url: cmd.url });
+      mqttClient.publish(loraOtaMqttTopic, payload, { qos: 1 }, (err) => {
+        if (err) console.error(`[MQTT] LoRa OTA publish error on ${loraOtaMqttTopic}:`, err.message);
+        else     console.log(`[FB→MQTT] LoRa OTA URL forwarded → ${loraOtaMqttTopic}:`, cmd.url);
+      });
+    });
+    console.log(`[FB] Listening for LoRa OTA commands on ${loraOtaFbPath}`);
+  }
+
   // Firebase → MQTT protection settings
   // Flutter writes {ov,uv,pl,dry_i,dry_t} to pumps/pump01/settings
   // Bridge publishes as retained MQTT so device receives settings on every reconnect
@@ -293,9 +330,11 @@ PUMPS.forEach((pumpId) => {
       dry_i:  s.dry_i  ?? 1.5,
       dry_t:  s.dry_t  ?? 8,
       dry_en: s.dry_en ?? 1,
+      uv_rst: s.uv_rst ?? 300,
     };
     if (s.hp != null) out.hp = s.hp;
     const payload = JSON.stringify(out);
+    latestSettingsPayload[pumpId] = { topic: settingsMqttTopic, payload };
     mqttClient.publish(settingsMqttTopic, payload, { qos: 1, retain: true }, (err) => {
       if (err) console.error(`[MQTT] Settings publish error on ${settingsMqttTopic}:`, err.message);
       else     console.log(`[FB→MQTT] Settings → ${settingsMqttTopic}:`, payload);
