@@ -154,10 +154,12 @@ mqttClient.on('message', (topic, message) => {
     }
 
     if (type === 'slave_log') {
+      // Skip slave log entries when Blue Pill is offline (r3/r4 unknown, rssi 0)
+      // age_s==0 with r3==-1 means firmware never received a LoRa heartbeat
+      if (payload.r3 === -1 && payload.r4 === -1 && payload.rssi === 0) return;
       // LoRa slave heartbeat — pushed to pumps/pump03/slave_log (2-day rolling window)
       const SLAVE_LOG_RETAIN_MS = 2 * 24 * 60 * 60 * 1000;
       db.ref(`pumps/${pumpId}/slave_log`).push(payload)
-        .then(() => console.log(`[FB] SlaveLog ${pumpId} r3=${payload.r3} r4=${payload.r4} rssi=${payload.rssi} age_s=${payload.age_s}`))
         .catch(err => console.error('[FB] SlaveLog push error:', err.message));
       // Purge entries older than 2 days
       const cutoff = (payload.ts || Date.now()) - SLAVE_LOG_RETAIN_MS;
@@ -372,8 +374,6 @@ setInterval(() => {
     // Skip rotation if any pump in the site is offline
     const anyOffline = pumps.some(p => !lastSeen[p] || (now - lastSeen[p]) > 90000);
     if (anyOffline) {
-      const offlinePumps = pumps.filter(p => !lastSeen[p] || (now - lastSeen[p]) > 90000);
-      console.log(`[Rotation:${id}] Skipped — offline: ${offlinePumps.join(', ')}`);
       // Reset timer so rotation waits a full interval after pumps come back online
       if (startedAt !== 0) {
         db.ref(`sites/${id}/rotation_schedule`).update({ started_at: now });
