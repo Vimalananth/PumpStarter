@@ -369,6 +369,18 @@ setInterval(() => {
     const pump1 = pumps[0];
     const pump2 = pumps[1];
 
+    // Skip rotation if any pump in the site is offline
+    const anyOffline = pumps.some(p => !lastSeen[p] || (now - lastSeen[p]) > 90000);
+    if (anyOffline) {
+      const offlinePumps = pumps.filter(p => !lastSeen[p] || (now - lastSeen[p]) > 90000);
+      console.log(`[Rotation:${id}] Skipped — offline: ${offlinePumps.join(', ')}`);
+      // Reset timer so rotation waits a full interval after pumps come back online
+      if (startedAt !== 0) {
+        db.ref(`sites/${id}/rotation_schedule`).update({ started_at: now });
+      }
+      return;
+    }
+
     if (startedAt === 0) {
       const p1Num = pump1.replace('pump', '');
       mqttClient.publish(`pump/${p1Num}/cmd`, JSON.stringify({ relay1: 1, src: 'rot' }), { qos: 1 });
@@ -405,11 +417,17 @@ PUMPS.forEach((pumpId) => {
 
 setInterval(() => {
   const now = new Date();
+  const nowMs = Date.now();
   const h = now.getHours();
   const m = now.getMinutes();
   PUMPS.forEach((pumpId) => {
     const s = schedules[pumpId];
     if (!s || !s.enabled) return;
+    // Skip schedule command if pump is offline
+    if (!lastSeen[pumpId] || (nowMs - lastSeen[pumpId]) > 90000) {
+      console.log(`[Schedule] ${pumpId} skipped — offline`);
+      return;
+    }
     const mqttNum = pumpId.replace('pump', '');
     const cmdTopic = `pump/${mqttNum}/cmd`;
     if (h === s.on_hour && m === s.on_min) {
