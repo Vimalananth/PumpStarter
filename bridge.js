@@ -73,14 +73,12 @@ mqttClient.on('connect', () => {
     mqttClient.publish(topic, payload, { qos: 1, retain: true },
       () => console.log(`[CFG] Re-published settings on connect → ${topic}`));
   });
-  // Clear all retained OTA messages on every (re)connect.
-  // Prevents a stale retained pump/XX/ota URL from looping the device into
-  // endless OTA reboots if the broker retained the message across a bridge restart.
-  PUMPS.forEach((pumpId) => {
-    const mqttNum = pumpId.replace('pump', '');
-    mqttClient.publish(`pump/${mqttNum}/ota`, '', { qos: 1, retain: true },
-      () => console.log(`[OTA] Cleared retained OTA on connect for ${pumpId}`));
-  });
+  // NOTE: We intentionally do NOT clear retained OTA messages on bridge connect.
+  // Doing so caused a race: bridge reconnects briefly after user pushes URL →
+  // clears the URL before the device ever subscribes → OTA never triggers.
+  // The device firmware self-clears (QoS=0 empty publish) when OTA starts, and
+  // the bridge clears again when it receives the "starting" ota/status message.
+  // These two per-event clears are sufficient.
 });
 
 mqttClient.on('reconnect', () => console.log('[MQTT] Reconnecting...'));
