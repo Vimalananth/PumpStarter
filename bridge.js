@@ -73,6 +73,14 @@ mqttClient.on('connect', () => {
     mqttClient.publish(topic, payload, { qos: 1, retain: true },
       () => console.log(`[CFG] Re-published settings on connect → ${topic}`));
   });
+  // Clear all retained OTA messages on every (re)connect.
+  // Prevents a stale retained pump/XX/ota URL from looping the device into
+  // endless OTA reboots if the broker retained the message across a bridge restart.
+  PUMPS.forEach((pumpId) => {
+    const mqttNum = pumpId.replace('pump', '');
+    mqttClient.publish(`pump/${mqttNum}/ota`, '', { qos: 1, retain: true },
+      () => console.log(`[OTA] Cleared retained OTA on connect for ${pumpId}`));
+  });
 });
 
 mqttClient.on('reconnect', () => console.log('[MQTT] Reconnecting...'));
@@ -145,11 +153,16 @@ mqttClient.on('message', (topic, message) => {
       // ota/status before the next regular status heartbeat.
       lastSeen[pumpId] = Date.now();
       db.ref(`pumps/${pumpId}/status/online`).set(true).catch(() => {});
-      // Clear retained OTA message so board doesn't re-trigger OTA on every reconnect
+      // Clear retained MQTT OTA message so board doesn't re-trigger OTA on reconnect
       const mqttNum = pumpId.replace('pump', '');
       const otaTopic = `pump/${mqttNum}/ota`;
       mqttClient.publish(otaTopic, '', { qos: 1, retain: true },
         () => console.log(`[MQTT] Cleared retained OTA on ${otaTopic}`));
+      // Also delete Firebase OTA node so bridge never re-publishes the URL
+      // (e.g. after bridge restart when Firebase listener fires with old value)
+      db.ref(`pumps/${pumpId}/ota`).remove()
+        .then(() => console.log(`[OTA] Firebase OTA node deleted for ${pumpId}`))
+        .catch(() => {});
       return;
     }
 
