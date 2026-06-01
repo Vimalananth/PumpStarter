@@ -73,12 +73,6 @@ mqttClient.on('connect', () => {
     mqttClient.publish(topic, payload, { qos: 1, retain: true },
       () => console.log(`[CFG] Re-published settings on connect → ${topic}`));
   });
-  // NOTE: We intentionally do NOT clear retained OTA messages on bridge connect.
-  // Doing so caused a race: bridge reconnects briefly after user pushes URL →
-  // clears the URL before the device ever subscribes → OTA never triggers.
-  // The device firmware self-clears (QoS=0 empty publish) when OTA starts, and
-  // the bridge clears again when it receives the "starting" ota/status message.
-  // These two per-event clears are sufficient.
 });
 
 mqttClient.on('reconnect', () => console.log('[MQTT] Reconnecting...'));
@@ -151,26 +145,19 @@ mqttClient.on('message', (topic, message) => {
       // ota/status before the next regular status heartbeat.
       lastSeen[pumpId] = Date.now();
       db.ref(`pumps/${pumpId}/status/online`).set(true).catch(() => {});
-      // Clear retained MQTT OTA message so board doesn't re-trigger OTA on reconnect
+      // Clear retained OTA message so board doesn't re-trigger OTA on every reconnect
       const mqttNum = pumpId.replace('pump', '');
       const otaTopic = `pump/${mqttNum}/ota`;
       mqttClient.publish(otaTopic, '', { qos: 1, retain: true },
         () => console.log(`[MQTT] Cleared retained OTA on ${otaTopic}`));
-      // Also delete Firebase OTA node so bridge never re-publishes the URL
-      // (e.g. after bridge restart when Firebase listener fires with old value)
-      db.ref(`pumps/${pumpId}/ota`).remove()
-        .then(() => console.log(`[OTA] Firebase OTA node deleted for ${pumpId}`))
-        .catch(() => {});
       return;
     }
 
     if (type === 'slave_log') {
-      // Skip slave log entries when Blue Pill is offline (r3/r4 unknown, rssi 0)
-      // age_s==0 with r3==-1 means firmware never received a LoRa heartbeat
-      if (payload.r3 === -1 && payload.r4 === -1 && payload.rssi === 0) return;
       // LoRa slave heartbeat — pushed to pumps/pump03/slave_log (2-day rolling window)
       const SLAVE_LOG_RETAIN_MS = 2 * 24 * 60 * 60 * 1000;
       db.ref(`pumps/${pumpId}/slave_log`).push(payload)
+        .then(() => console.log(`[FB] SlaveLog ${pumpId} r3=${payload.r3} r4=${payload.r4} rssi=${payload.rssi} age_s=${payload.age_s}`))
         .catch(err => console.error('[FB] SlaveLog push error:', err.message));
       // Purge entries older than 2 days
       const cutoff = (payload.ts || Date.now()) - SLAVE_LOG_RETAIN_MS;
@@ -286,7 +273,16 @@ PUMPS.forEach((pumpId) => {
       return;
     }
 
-    const payload = JSON.stringify({ url: cmd.url });
+    // Attach reference CRC if the URL matches one of our served firmware files
+    const payloadObj = { url: cmd.url };
+    for (const [fname, crc] of Object.entries(firmwareCrcs)) {
+      if (cmd.url.endsWith('/' + fname)) {
+        payloadObj.crc32 = crc;
+        console.log(`[OTA] Attaching CRC32 ${crc} for ${fname}`);
+        break;
+      }
+    }
+    const payload = JSON.stringify(payloadObj);
     mqttClient.publish(otaMqttTopic, payload, { qos: 1, retain: true }, (err) => {
       if (err) console.error(`[MQTT] OTA publish error on ${otaMqttTopic}:`, err.message);
       else     console.log(`[FB→MQTT] OTA URL forwarded → ${otaMqttTopic}:`, cmd.url);
@@ -382,16 +378,6 @@ setInterval(() => {
     const pump1 = pumps[0];
     const pump2 = pumps[1];
 
-    // Skip rotation if any pump in the site is offline
-    const anyOffline = pumps.some(p => !lastSeen[p] || (now - lastSeen[p]) > 90000);
-    if (anyOffline) {
-      // Reset timer so rotation waits a full interval after pumps come back online
-      if (startedAt !== 0) {
-        db.ref(`sites/${id}/rotation_schedule`).update({ started_at: now });
-      }
-      return;
-    }
-
     if (startedAt === 0) {
       const p1Num = pump1.replace('pump', '');
       mqttClient.publish(`pump/${p1Num}/cmd`, JSON.stringify({ relay1: 1, src: 'rot' }), { qos: 1 });
@@ -428,17 +414,11 @@ PUMPS.forEach((pumpId) => {
 
 setInterval(() => {
   const now = new Date();
-  const nowMs = Date.now();
   const h = now.getHours();
   const m = now.getMinutes();
   PUMPS.forEach((pumpId) => {
     const s = schedules[pumpId];
     if (!s || !s.enabled) return;
-    // Skip schedule command if pump is offline
-    if (!lastSeen[pumpId] || (nowMs - lastSeen[pumpId]) > 90000) {
-      console.log(`[Schedule] ${pumpId} skipped — offline`);
-      return;
-    }
     const mqttNum = pumpId.replace('pump', '');
     const cmdTopic = `pump/${mqttNum}/cmd`;
     if (h === s.on_hour && m === s.on_min) {
@@ -475,6 +455,30 @@ setInterval(() => {
 const PORT          = process.env.PORT || 3000;
 const FIRMWARE_FILE      = path.join(__dirname, 'firmware.bin');
 const FIRMWARE_TEST_FILE = path.join(__dirname, 'firmware_test.bin');
+
+// ─── CRC32 (IEEE 802.3, poly 0xEDB88320) — matches ota.c implementation ──────
+// Used to embed a reference CRC in OTA trigger messages so the STM32 can detect
+// stream corruption before writing the OTA flags page.
+function computeCrc32(buf) {
+  let crc = 0xFFFFFFFF;
+  for (let i = 0; i < buf.length; i++) {
+    crc ^= buf[i];
+    for (let b = 0; b < 8; b++) {
+      crc = (crc >>> 1) ^ ((crc & 1) ? 0xEDB88320 : 0);
+    }
+  }
+  return ((crc ^ 0xFFFFFFFF) >>> 0);
+}
+
+// Pre-compute CRC32 for each firmware file at startup so OTA triggers can include it.
+const firmwareCrcs = {};
+[['firmware.bin', FIRMWARE_FILE], ['firmware_test.bin', FIRMWARE_TEST_FILE]].forEach(([name, fpath]) => {
+  if (fs.existsSync(fpath)) {
+    const crc = computeCrc32(fs.readFileSync(fpath));
+    firmwareCrcs[name] = crc.toString(16).toUpperCase().padStart(8, '0');
+    console.log(`[CRC] ${name}: 0x${firmwareCrcs[name]}`);
+  }
+});
 
 function serveFirmware(req, res, filePath, fileName) {
   if (!fs.existsSync(filePath)) {
