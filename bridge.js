@@ -41,7 +41,7 @@ const mqttClient = mqtt.connect(BROKER_URL, {
 const PUMPS = ['pump01', 'pump02', 'pump03', 'pump04'];
 
 const TOPICS_SUB = [
-  'pump/01/status', 'pump/01/alerts', 'pump/01/ota/status', 'pump/01/log', 'pump/01/slave_log',
+  'pump/01/status', 'pump/01/alerts', 'pump/01/ota/status', 'pump/01/log',
   'pump/02/status', 'pump/02/alerts', 'pump/02/ota/status', 'pump/02/log',
   'pump/03/status', 'pump/03/alerts', 'pump/03/ota/status', 'pump/03/log', 'pump/03/slave_log',
   'pump/04/status', 'pump/04/alerts', 'pump/04/ota/status', 'pump/04/log'
@@ -341,9 +341,7 @@ PUMPS.forEach((pumpId) => {
       dry_en: s.dry_en ?? 1,
       uv_rst: s.uv_rst ?? 300,
     };
-    if (s.hp     != null) out.hp      = s.hp;
-    if (s.rot_en != null) out.rot_en  = s.rot_en;
-    if (s.rot_min!= null) out.rot_min = s.rot_min;
+    if (s.hp != null) out.hp = s.hp;
     const payload = JSON.stringify(out);
     latestSettingsPayload[pumpId] = { topic: settingsMqttTopic, payload };
     mqttClient.publish(settingsMqttTopic, payload, { qos: 1, retain: true }, (err) => {
@@ -355,10 +353,56 @@ PUMPS.forEach((pumpId) => {
   console.log(`[FB] Listening for settings on ${settingsFbPath}`);
 });
 
-// ─── Rotation schedule — DISABLED (moved to STM32 firmware) ──────────────────
-// Rotation is now handled entirely on the device (modem.c run_rotation()).
-// Settings rot_en + rot_min flow via pumps/{pumpId}/settings → MQTT settings topic.
-// Device publishes rot_active + rot_remain_s in status so the app can display state.
+// ─── Rotation schedule — per-site, alternate pumps every N minutes ────────────
+const SITE_CONFIGS = [
+  { id: 'site01', pumps: ['pump01', 'pump02'] },
+  { id: 'site02', pumps: ['pump03', 'pump04'] },
+];
+
+const rotationSchedules = {};
+SITE_CONFIGS.forEach(({ id }) => {
+  db.ref(`sites/${id}/rotation_schedule`).on('value', (snap) => {
+    rotationSchedules[id] = snap.val();
+  });
+  console.log(`[FB] Listening for rotation on sites/${id}/rotation_schedule`);
+});
+
+setInterval(() => {
+  SITE_CONFIGS.forEach(({ id, pumps }) => {
+    const rs = rotationSchedules[id];
+    if (!rs || !rs.enabled) return;
+
+    const now        = Date.now();
+    const intervalMs = (rs.interval_minutes || 240) * 60 * 1000;
+    const startedAt  = rs.started_at || 0;
+    const pump1 = pumps[0];
+    const pump2 = pumps[1];
+
+    if (startedAt === 0) {
+      const p1Num = pump1.replace('pump', '');
+      mqttClient.publish(`pump/${p1Num}/cmd`, JSON.stringify({ relay1: 1, src: 'rot' }), { qos: 1 });
+      db.ref(`sites/${id}/rotation_schedule`).update({ current_pump: pump1, started_at: now });
+      console.log(`[Rotation:${id}] Started — ${pump1} ON`);
+      return;
+    }
+
+    if (now - startedAt >= intervalMs) {
+      const current = rs.current_pump || pump1;
+      const next    = current === pump1 ? pump2 : pump1;
+      const curNum  = current.replace('pump', '');
+      const nxtNum  = next.replace('pump', '');
+
+      // Turn current off, then turn next on after 2 s
+      mqttClient.publish(`pump/${curNum}/cmd`, JSON.stringify({ relay1: 0, src: 'rot' }), { qos: 1 });
+      setTimeout(() => {
+        mqttClient.publish(`pump/${nxtNum}/cmd`, JSON.stringify({ relay1: 1, src: 'rot' }), { qos: 1 });
+      }, 2000);
+
+      db.ref(`sites/${id}/rotation_schedule`).update({ current_pump: next, started_at: now });
+      console.log(`[Rotation:${id}] ${current} → ${next}`);
+    }
+  });
+}, 60000);
 
 // ─── Schedule execution — check every minute, publish ON/OFF commands ────────
 const schedules = {};
