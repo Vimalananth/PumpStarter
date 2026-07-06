@@ -43,7 +43,7 @@ const PUMPS = ['pump01', 'pump02', 'pump03', 'pump04'];
 const TOPICS_SUB = [
   'pump/01/status', 'pump/01/alerts', 'pump/01/ota/status', 'pump/01/log',
   'pump/02/status', 'pump/02/alerts', 'pump/02/ota/status', 'pump/02/log',
-  'pump/03/status', 'pump/03/alerts', 'pump/03/ota/status', 'pump/03/log', 'pump/03/slave_log',
+  'pump/03/status', 'pump/03/alerts', 'pump/03/ota/status', 'pump/03/log', 'pump/03/slave_status', 'pump/03/slave_vlog',
   'pump/04/status', 'pump/04/alerts', 'pump/04/ota/status', 'pump/04/log'
 ];
 
@@ -153,15 +153,23 @@ mqttClient.on('message', (topic, message) => {
       return;
     }
 
-    if (type === 'slave_log') {
-      // LoRa slave heartbeat — pushed to pumps/pump03/slave_log (2-day rolling window)
-      const SLAVE_LOG_RETAIN_MS = 2 * 24 * 60 * 60 * 1000;
-      db.ref(`pumps/${pumpId}/slave_log`).push(payload)
-        .then(() => console.log(`[FB] SlaveLog ${pumpId} r3=${payload.r3} r4=${payload.r4} rssi=${payload.rssi} age_s=${payload.age_s}`))
-        .catch(err => console.error('[FB] SlaveLog push error:', err.message));
+    if (type === 'slave_status') {
+      // LoRa slave live status — set() so it always reflects latest state
+      db.ref(`pumps/${pumpId}/slave_status`).set(payload)
+        .then(() => console.log(`[FB] SlaveStatus ${pumpId} online=${payload.online} relay=${payload.relay} rssi=${payload.rssi}`))
+        .catch(err => console.error('[FB] SlaveStatus set error:', err.message));
+      return;
+    }
+
+    if (type === 'slave_vlog') {
+      // LoRa slave voltage log — push() every 5 min, kept for 2 days
+      const SLAVE_VLOG_RETAIN_MS = 2 * 24 * 60 * 60 * 1000;
+      db.ref(`pumps/${pumpId}/slave_vlog`).push(payload)
+        .then(() => console.log(`[FB] SlaveVlog ${pumpId} v1=${payload.v1} kw=${payload.kw}`))
+        .catch(err => console.error('[FB] SlaveVlog push error:', err.message));
       // Purge entries older than 2 days
-      const cutoff = (payload.ts || Date.now()) - SLAVE_LOG_RETAIN_MS;
-      db.ref(`pumps/${pumpId}/slave_log`).orderByChild('ts').endAt(cutoff)
+      const cutoff = (payload.ts || Date.now()) - SLAVE_VLOG_RETAIN_MS;
+      db.ref(`pumps/${pumpId}/slave_vlog`).orderByChild('ts').endAt(cutoff)
         .once('value', snap => snap.forEach(child => child.ref.remove()));
       return;
     }
