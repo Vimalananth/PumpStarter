@@ -1,5 +1,6 @@
 // pump-controller/bridge/bridge.js
-// Bridges HiveMQ Cloud <-> Firebase Realtime DB for 2 pumps
+// Bridges HiveMQ Cloud <-> Firebase Realtime DB
+// New structure: sites/{siteId}/lines/{lineId}/pumps/{pumpId}/
 
 const mqtt  = require('mqtt');
 const admin = require('firebase-admin');
@@ -8,9 +9,6 @@ const fs    = require('fs');
 const path  = require('path');
 
 // ─── Firebase init ────────────────────────────────────────────────────────────
-// On Railway: set FIREBASE_SERVICE_ACCOUNT env var to the full JSON content
-//             of serviceAccountKey.json (paste the whole file as one line).
-// Locally:    set the same env var, or fall back to serviceAccountKey.json file.
 console.log('[Init] FIREBASE_SERVICE_ACCOUNT set:', !!process.env.FIREBASE_SERVICE_ACCOUNT);
 console.log('[Init] FIREBASE_DB_URL:', process.env.FIREBASE_DB_URL || '(using default)');
 
@@ -27,62 +25,102 @@ admin.initializeApp({
 });
 const db = admin.database();
 
-// ─── broker.emqx.io connection (anonymous public TLS) ────────────────────────
+// ─── MQTT broker ─────────────────────────────────────────────────────────────
 const BROKER_URL = 'mqtts://broker.emqx.io:8883';
 
 const mqttClient = mqtt.connect(BROKER_URL, {
-  clientId:          'bridge_node_' + Math.random().toString(16).slice(2, 8),
+  clientId:           'bridge_node_' + Math.random().toString(16).slice(2, 8),
   rejectUnauthorized: false,
-  keepalive:         60,
-  reconnectPeriod:   3000
+  keepalive:          60,
+  reconnectPeriod:    3000
 });
 
-// ─── Topics ───────────────────────────────────────────────────────────────────
-const PUMPS = ['pump01', 'pump02', 'pump03', 'pump04'];
+// ─── MQTT → Firebase topic map ────────────────────────────────────────────────
+// method: 'set'  → db.ref(fbPath).set(payload)       (overwrites, latest state)
+// method: 'push' → db.ref(fbPath).push(payload)      (appends, time-series log)
+const TOPIC_MAP = {
+  // ── site01: line01/pump01 (relay1) ──
+  'pump/01/status':     { fbPath: 'sites/site01/line01/pump01/status',    method: 'set',  mqttId: '01' },
+  'pump/01/alerts':     { fbPath: 'sites/site01/line01/pump01/alerts',    method: 'push', mqttId: '01' },
+  'pump/01/log':        { fbPath: 'sites/site01/line01/pump01/alerts',    method: 'push', mqttId: '01' },
+  'pump/01/vlog':       { fbPath: 'sites/site01/line01/pump01/logs',      method: 'push', mqttId: '01' },
+  'pump/01/ota/status': { fbPath: 'sites/site01/line01/pump01/ota_status',method: 'set',  mqttId: '01', isOta: true },
 
-const TOPICS_SUB = [
-  'pump/01/status', 'pump/01/alerts', 'pump/01/ota/status', 'pump/01/log',
-  'pump/02/status', 'pump/02/alerts', 'pump/02/ota/status', 'pump/02/log',
-  'pump/03/status', 'pump/03/alerts', 'pump/03/ota/status', 'pump/03/log', 'pump/03/slave_status', 'pump/03/slave_vlog',
-  'pump/04/status', 'pump/04/alerts', 'pump/04/ota/status', 'pump/04/log'
+  // ── site01: line01/pump02 (relay2) ──
+  'pump/02/status':     { fbPath: 'sites/site01/line01/pump02/status',    method: 'set',  mqttId: '02' },
+  'pump/02/alerts':     { fbPath: 'sites/site01/line01/pump02/alerts',    method: 'push', mqttId: '02' },
+  'pump/02/log':        { fbPath: 'sites/site01/line01/pump02/alerts',    method: 'push', mqttId: '02' },
+  'pump/02/vlog':       { fbPath: 'sites/site01/line01/pump02/logs',      method: 'push', mqttId: '02' },
+  'pump/02/ota/status': { fbPath: 'sites/site01/line01/pump02/ota_status',method: 'set',  mqttId: '02', isOta: true },
+
+  // ── site02: line01/pump01 (relay1) ──
+  'pump/03/status':     { fbPath: 'sites/site02/line01/pump01/status',    method: 'set',  mqttId: '03' },
+  'pump/03/alerts':     { fbPath: 'sites/site02/line01/pump01/alerts',    method: 'push', mqttId: '03' },
+  'pump/03/log':        { fbPath: 'sites/site02/line01/pump01/alerts',    method: 'push', mqttId: '03' },
+  'pump/03/vlog':       { fbPath: 'sites/site02/line01/pump01/logs',      method: 'push', mqttId: '03' },
+  'pump/03/ota/status': { fbPath: 'sites/site02/line01/pump01/ota_status',method: 'set',  mqttId: '03', isOta: true },
+
+  // ── site02: line01/pump02 (relay2) ──
+  'pump/04/status':     { fbPath: 'sites/site02/line01/pump02/status',    method: 'set',  mqttId: '04' },
+  'pump/04/alerts':     { fbPath: 'sites/site02/line01/pump02/alerts',    method: 'push', mqttId: '04' },
+  'pump/04/log':        { fbPath: 'sites/site02/line01/pump02/alerts',    method: 'push', mqttId: '04' },
+  'pump/04/vlog':       { fbPath: 'sites/site02/line01/pump02/logs',      method: 'push', mqttId: '04' },
+  'pump/04/ota/status': { fbPath: 'sites/site02/line01/pump02/ota_status',method: 'set',  mqttId: '04', isOta: true },
+
+  // ── site01: line02/pump01 (Blue Pill slave via LoRa) ──
+  'pump/01/slave_status': { fbPath: 'sites/site01/line02/pump01/status', method: 'set',  mqttId: '01' },
+  'pump/01/slave_vlog':   { fbPath: 'sites/site01/line02/pump01/logs',   method: 'push', mqttId: '01' },
+  'pump/01/slave_alerts': { fbPath: 'sites/site01/line02/pump01/alerts', method: 'push', mqttId: '01' },
+
+  // ── site02: line02/pump01 (Blue Pill slave via LoRa) ──
+  'pump/03/slave_status': { fbPath: 'sites/site02/line02/pump01/status', method: 'set',  mqttId: '03' },
+  'pump/03/slave_vlog':   { fbPath: 'sites/site02/line02/pump01/logs',   method: 'push', mqttId: '03' },
+  'pump/03/slave_alerts': { fbPath: 'sites/site02/line02/pump01/alerts', method: 'push', mqttId: '03' },
+};
+
+// ─── Firebase → MQTT pump configs ────────────────────────────────────────────
+// Each entry defines one Firebase pump path and how to route its commands/settings to MQTT.
+// cmdRelayMap: maps incoming Firebase relay field → outgoing MQTT relay field.
+const PUMP_CONFIGS = [
+  {
+    fbBase:      'sites/site01/line01/pump01',
+    mqttNum:     '01',
+    cmdRelayMap: { relay1: 'relay1', relay2: 'relay2' },
+    label:       'Site01 Line01 Pump01',
+  },
+  {
+    fbBase:      'sites/site01/line01/pump02',
+    mqttNum:     '02',
+    cmdRelayMap: { relay1: 'relay1', relay2: 'relay2' },
+    label:       'Site01 Line01 Pump02',
+  },
+  {
+    fbBase:      'sites/site02/line01/pump01',
+    mqttNum:     '03',
+    cmdRelayMap: { relay1: 'relay1', relay2: 'relay2' },
+    label:       'Site02 Line01 Pump01',
+  },
+  {
+    fbBase:      'sites/site02/line01/pump02',
+    mqttNum:     '04',
+    cmdRelayMap: { relay1: 'relay1', relay2: 'relay2' },
+    label:       'Site02 Line01 Pump02',
+  },
+  {
+    fbBase:      'sites/site01/line02/pump01',
+    mqttNum:     '01',                                   /* same device as line01/pump01 */
+    cmdRelayMap: { relay1: 'relay3', relay2: 'relay4' }, /* relay1 from app → relay3 to LoRa slave */
+    label:       'Site01 Line02 Pump01 (Blue Pill)',
+  },
+  {
+    fbBase:      'sites/site02/line02/pump01',
+    mqttNum:     '03',                                   /* same device as line01/pump01 */
+    cmdRelayMap: { relay1: 'relay3', relay2: 'relay4' }, /* relay1 from app → relay3 to LoRa slave */
+    label:       'Site02 Line02 Pump01 (Blue Pill)',
+  },
 ];
 
-// pump/01/status        ->  { pumpId: 'pump01', type: 'status' }
-// pump/01/ota/status    ->  { pumpId: 'pump01', type: 'ota/status' }
-function topicToFirebase(topic) {
-  const parts = topic.split('/');
-  return { pumpId: 'pump' + parts[1], type: parts.slice(2).join('/') };
-}
-
-// ─── Latest settings cache — re-published on every MQTT connect ───────────────
-// Public brokers (broker.emqx.io) do not persist retained messages across
-// restarts.  On reconnect we re-push all cached settings payloads so the
-// device always receives correct settings after a broker or bridge restart.
-const latestSettingsPayload = {};
-
-// ─── MQTT events ──────────────────────────────────────────────────────────────
-mqttClient.on('connect', () => {
-  console.log('[MQTT] Connected to broker.emqx.io');
-  mqttClient.subscribe(TOPICS_SUB, { qos: 1 }, (err) => {
-    if (err) console.error('[MQTT] Subscribe error:', err);
-    else     console.log('[MQTT] Subscribed to:', TOPICS_SUB);
-  });
-  // Re-publish all cached settings as retained so broker state is restored
-  // after a broker restart (which wipes its retained message store).
-  Object.values(latestSettingsPayload).forEach(({ topic, payload }) => {
-    mqttClient.publish(topic, payload, { qos: 1, retain: true },
-      () => console.log(`[CFG] Re-published settings on connect → ${topic}`));
-  });
-});
-
-mqttClient.on('reconnect', () => console.log('[MQTT] Reconnecting...'));
-mqttClient.on('error',     (err) => console.error('[MQTT] Error:', err.message));
-
 // ─── FCM helpers ─────────────────────────────────────────────────────────────
-function pumpLabel(pumpId) {
-  return `Pump ${parseInt(pumpId.replace('pump', ''), 10)}`;
-}
-
 function fmtRunTime(s) {
   if (s < 60)   return `${s}s`;
   if (s < 3600) return `${Math.floor(s / 60)}m ${s % 60}s`;
@@ -102,241 +140,178 @@ async function sendFCM(topic, title, body) {
   }
 }
 
-// ─── EC200U publishes status/alerts → write to Firebase ──────────────────────
-const lastSeen        = { pump01: Date.now(), pump02: Date.now(), pump03: Date.now(), pump04: Date.now() };
-const offlineNotified = { pump01: false, pump02: false, pump03: false, pump04: false };
+// FCM topic derived from Firebase path (e.g. sites/site02/line01/pump01 → site02_line01_pump01)
+function fcmTopic(fbBase) {
+  return fbBase.replace('sites/', '').replace(/\//g, '_');
+}
 
-// ─── Voltage / current sampler — one entry per 5 min, kept for 5 days ────────
-const VOLTAGE_LOG_INTERVAL_MS = 5 * 60 * 1000;           // 5 minutes
-const VOLTAGE_LOG_RETAIN_MS   = 5 * 24 * 60 * 60 * 1000; // 5 days
-const lastVoltageLog = { pump01: 0, pump02: 0, pump03: 0, pump04: 0 };
+// ─── Online detection ─────────────────────────────────────────────────────────
+// Track last status received per Firebase status path.
+// Device considered offline if no status for 15 min (keepalive is 10 min).
+const OFFLINE_TIMEOUT_MS = 15 * 60 * 1000;
+const lastSeen        = {};
+const offlineNotified = {};
 
-function maybeLogVoltage(pumpId, payload) {
-  const now = Date.now();
-  if (now - lastVoltageLog[pumpId] < VOLTAGE_LOG_INTERVAL_MS) return;
-  lastVoltageLog[pumpId] = now;
+// ─── Log retention ────────────────────────────────────────────────────────────
+const LOG_RETAIN_MS = 5 * 24 * 60 * 60 * 1000; // 5 days
 
-  const v1 = payload.v1, v2 = payload.v2, v3 = payload.v3;
-  const current = payload.current;
-  const kw      = payload.kw ?? 0;
-  if (!v1 && !v2 && !v3) return; // skip if no real sensor data
-
-  db.ref(`pumps/${pumpId}/voltage_log`).push({ ts: now, v1, v2, v3, current, kw })
-    .then(() => console.log(`[VLog] ${pumpId} v1=${v1} v2=${v2} v3=${v3} i=${current}A kw=${kw}kW`))
-    .catch(err => console.error('[VLog] Write error:', err.message));
-
-  // Purge entries older than 5 days
-  db.ref(`pumps/${pumpId}/voltage_log`).orderByChild('ts')
-    .endAt(now - VOLTAGE_LOG_RETAIN_MS)
+function purgeOldLogs(fbPath, cutoff) {
+  db.ref(fbPath).orderByChild('ts').endAt(cutoff)
     .once('value', snap => snap.forEach(child => child.ref.remove()));
 }
 
-mqttClient.on('message', (topic, message) => {
-  try {    const payload = JSON.parse(message.toString());
-    const { pumpId, type } = topicToFirebase(topic);
-    if (!payload.ts) payload.ts = Date.now(); /* use device ts if present, else stamp here */
+// ─── MQTT events ──────────────────────────────────────────────────────────────
+const TOPICS_SUB = Object.keys(TOPIC_MAP);
 
-    if (type === 'ota/status') {
-      // OTA progress/result — write to pumps/pump01/ota_status
-      db.ref(`pumps/${pumpId}/ota_status`).set(payload)
-        .then(()  => console.log(`[FB] Written pumps/${pumpId}/ota_status`))
-        .catch(err => console.error('[FB] Write error:', err.message));
-      // Treat OTA status as liveness too: after reboot the board may publish
-      // ota/status before the next regular status heartbeat.
-      lastSeen[pumpId] = Date.now();
-      db.ref(`pumps/${pumpId}/status/online`).set(true).catch(() => {});
-      // Clear retained OTA message so board doesn't re-trigger OTA on every reconnect
-      const mqttNum = pumpId.replace('pump', '');
-      const otaTopic = `pump/${mqttNum}/ota`;
+mqttClient.on('connect', () => {
+  console.log('[MQTT] Connected to broker.emqx.io');
+  mqttClient.subscribe(TOPICS_SUB, { qos: 1 }, (err) => {
+    if (err) console.error('[MQTT] Subscribe error:', err);
+    else     console.log('[MQTT] Subscribed to', TOPICS_SUB.length, 'topics');
+  });
+  // Re-publish cached settings so device gets them after broker restart
+  Object.values(latestSettingsPayload).forEach(({ topic, payload }) => {
+    mqttClient.publish(topic, payload, { qos: 1, retain: true },
+      () => console.log(`[CFG] Re-published settings → ${topic}`));
+  });
+});
+
+mqttClient.on('reconnect', () => console.log('[MQTT] Reconnecting...'));
+mqttClient.on('error',     (err) => console.error('[MQTT] Error:', err.message));
+
+mqttClient.on('message', (topic, message) => {
+  try {
+    const payload = JSON.parse(message.toString());
+    const mapping = TOPIC_MAP[topic];
+    if (!mapping) return;
+
+    if (!payload.ts) payload.ts = Date.now();
+
+    // ── OTA status: clear retained OTA trigger after reboot ──────────────────
+    if (mapping.isOta) {
+      db.ref(mapping.fbPath).set(payload)
+        .then(() => console.log(`[FB] OTA status → ${mapping.fbPath}`))
+        .catch(err => console.error('[FB] OTA status error:', err.message));
+      // Clear retained OTA message so board doesn't re-trigger on reconnect
+      const otaTopic = `pump/${mapping.mqttId}/ota`;
       mqttClient.publish(otaTopic, '', { qos: 1, retain: true },
         () => console.log(`[MQTT] Cleared retained OTA on ${otaTopic}`));
+      // Mark device as seen
+      const statusPath = mapping.fbPath.replace('/ota_status', '/status');
+      lastSeen[statusPath] = Date.now();
+      db.ref(statusPath + '/online').set(true).catch(() => {});
       return;
     }
 
-    if (type === 'slave_status') {
-      // LoRa slave live status — set() so it always reflects latest state
-      db.ref(`pumps/${pumpId}/slave_status`).set(payload)
-        .then(() => console.log(`[FB] SlaveStatus ${pumpId} online=${payload.online} relay=${payload.relay} rssi=${payload.rssi}`))
-        .catch(err => console.error('[FB] SlaveStatus set error:', err.message));
-      return;
-    }
+    // ── Write to Firebase ─────────────────────────────────────────────────────
+    if (mapping.method === 'set') {
+      db.ref(mapping.fbPath).set(payload)
+        .then(() => console.log(`[FB] set → ${mapping.fbPath}`))
+        .catch(err => console.error('[FB] set error:', err.message));
 
-    if (type === 'slave_vlog') {
-      // LoRa slave voltage log — push() every 5 min, kept for 2 days
-      const SLAVE_VLOG_RETAIN_MS = 2 * 24 * 60 * 60 * 1000;
-      db.ref(`pumps/${pumpId}/slave_vlog`).push(payload)
-        .then(() => console.log(`[FB] SlaveVlog ${pumpId} v1=${payload.v1} kw=${payload.kw}`))
-        .catch(err => console.error('[FB] SlaveVlog push error:', err.message));
-      // Purge entries older than 2 days
-      const cutoff = (payload.ts || Date.now()) - SLAVE_VLOG_RETAIN_MS;
-      db.ref(`pumps/${pumpId}/slave_vlog`).orderByChild('ts').endAt(cutoff)
-        .once('value', snap => snap.forEach(child => child.ref.remove()));
-      return;
-    }
-
-    if (type === 'log') {
-      // Use push() so each log entry gets a unique time-sorted key
-      db.ref(`pumps/${pumpId}/logs`).push(payload)
-        .then(()  => console.log(`[FB] Log pushed pumps/${pumpId}/logs: ${payload.event}/${payload.reason}`))
-        .catch(err => console.error('[FB] Log push error:', err.message));
-      // Notify ON / OFF events
-      const label = pumpLabel(pumpId);
-      if (payload.event === 'on') {
-        const src = payload.reason || 'manual';
-        sendFCM(pumpId, `${label} Started`, `Turned ON (${src})`);
-      } else if (payload.event === 'off') {
-        const src     = payload.reason || 'manual';
-        const runStr  = payload.run_s ? ` — ran ${fmtRunTime(payload.run_s)}` : '';
-        sendFCM(pumpId, `${label} Stopped`, `Turned OFF (${src})${runStr}`);
+      // Track online status for status topics
+      if (topic.endsWith('/status') || topic.endsWith('/slave_status')) {
+        lastSeen[mapping.fbPath] = Date.now();
+        const topic_fcm = fcmTopic(mapping.fbPath.replace('/status', ''));
+        if (offlineNotified[mapping.fbPath]) {
+          offlineNotified[mapping.fbPath] = false;
+          sendFCM(topic_fcm, `${mapping.label || topic} — Back Online`, 'Device reconnected');
+        }
       }
-      return;
-    }
 
-    db.ref(`pumps/${pumpId}/${type}`).set(payload)
-      .then(()  => console.log(`[FB] Written pumps/${pumpId}/${type}`))
-      .catch(err => console.error('[FB] Write error:', err.message));
+    } else {
+      // push() — append log entry with auto-purge
+      db.ref(mapping.fbPath).push(payload)
+        .then(() => console.log(`[FB] push → ${mapping.fbPath}`))
+        .catch(err => console.error('[FB] push error:', err.message));
 
-    if (type === 'status') {
-      lastSeen[pumpId] = Date.now();
-      if (offlineNotified[pumpId]) {
-        // Device just came back — send recovery notification
-        offlineNotified[pumpId] = false;
-        sendFCM(pumpId, `${pumpLabel(pumpId)} — Back Online`, 'Device has reconnected and is sending heartbeats');
+      purgeOldLogs(mapping.fbPath, Date.now() - LOG_RETAIN_MS);
+
+      // FCM for relay on/off events in alerts
+      if (topic.endsWith('/log')) {
+        const label = mapping.label || topic;
+        const topic_fcm = fcmTopic(mapping.fbPath.replace('/alerts', ''));
+        if (payload.event === 'on') {
+          sendFCM(topic_fcm, `${label} Started`, `Turned ON (${payload.reason || 'manual'})`);
+        } else if (payload.event === 'off') {
+          const runStr = payload.run_s ? ` — ran ${fmtRunTime(payload.run_s)}` : '';
+          sendFCM(topic_fcm, `${label} Stopped`, `Turned OFF (${payload.reason || 'manual'})${runStr}`);
+        }
       }
-      maybeLogVoltage(pumpId, payload);
+
+      // FCM for protection alerts
+      if (topic.endsWith('/alerts')) {
+        const label = mapping.label || topic;
+        const topic_fcm = fcmTopic(mapping.fbPath.replace('/alerts', ''));
+        if (payload.dry_run_trip) sendFCM(topic_fcm, `${label} — Dry Run Trip`,  'Pump tripped: no water detected');
+        if (payload.overvoltage)  sendFCM(topic_fcm, `${label} — Overvoltage`,   'Pump tripped: voltage too high');
+        if (payload.undervoltage) sendFCM(topic_fcm, `${label} — Undervoltage`,  'Pump tripped: voltage too low');
+        if (payload.phase_loss)   sendFCM(topic_fcm, `${label} — Phase Loss`,    'Pump tripped: phase loss detected');
+      }
+
+      // FCM for slave online/offline alerts
+      if (topic.endsWith('/slave_alerts')) {
+        const topic_fcm = fcmTopic(mapping.fbPath.replace('/alerts', ''));
+        if (payload.event === 'slave_offline') sendFCM(topic_fcm, 'Slave Offline', 'Blue Pill not responding via LoRa');
+        if (payload.event === 'slave_online')  sendFCM(topic_fcm, 'Slave Online',  'Blue Pill reconnected via LoRa');
+      }
     }
 
-    if (type === 'alerts') {
-      const label = pumpLabel(pumpId);
-      if (payload.dry_run_trip) sendFCM(pumpId, `${label} — Dry Run Trip`,  'Pump tripped: no water detected');
-      if (payload.overvoltage)  sendFCM(pumpId, `${label} — Overvoltage`,   'Pump tripped: voltage too high');
-      if (payload.undervoltage) sendFCM(pumpId, `${label} — Undervoltage`,  'Pump tripped: voltage too low');
-      if (payload.phase_loss)   sendFCM(pumpId, `${label} — Phase Loss`,    'Pump tripped: phase loss detected');
-    }
   } catch (e) {
     console.error('[MQTT] Parse error:', e.message, '| raw:', message.toString());
   }
 });
 
-// ─── Firebase → MQTT relay commands ──────────────────────────────────────────
-// initialized flag prevents re-sending the last stored command when the
-// bridge starts (or restarts) and the Firebase listener fires its initial read.
-PUMPS.forEach((pumpId) => {
-  const mqttNum  = pumpId.replace('pump', ''); // pump01 -> 01
-  const cmdTopic = `pump/${mqttNum}/cmd`;
-  const fbPath   = `pumps/${pumpId}/cmd`;
-  let initialized = false;
-
-  db.ref(fbPath).on('value', (snapshot) => {
-    if (!initialized) {
-      initialized = true;
-      return; // skip initial read on startup — only forward new writes
+// ─── Offline detection — mark pump offline if no status for 15 min ────────────
+setInterval(() => {
+  const now = Date.now();
+  Object.keys(lastSeen).forEach((statusPath) => {
+    if (now - lastSeen[statusPath] > OFFLINE_TIMEOUT_MS) {
+      db.ref(statusPath + '/online').set(false).catch(() => {});
+      if (!offlineNotified[statusPath]) {
+        offlineNotified[statusPath] = true;
+        const topic_fcm = fcmTopic(statusPath.replace('/status', ''));
+        sendFCM(topic_fcm, 'Device Offline', 'No heartbeat received');
+      }
     }
+  });
+}, 60000);
 
+// ─── Firebase → MQTT: commands, settings, OTA ────────────────────────────────
+const latestSettingsPayload = {};
+
+PUMP_CONFIGS.forEach((cfg) => {
+  const cmdTopic      = `pump/${cfg.mqttNum}/cmd`;
+  const settingsTopic = `pump/${cfg.mqttNum}/settings`;
+  const otaTopic      = `pump/${cfg.mqttNum}/ota`;
+
+  // ── Commands ──
+  let cmdInitialized = false;
+  db.ref(`${cfg.fbBase}/cmd`).on('value', (snapshot) => {
+    if (!cmdInitialized) { cmdInitialized = true; return; }
     const cmd = snapshot.val();
     if (!cmd) return;
 
-    // Only forward fields that are present — missing fields must NOT default to 0
-    // (would pulse the wrong coil on a latching relay).
-    // pump03/04: relay1/relay2 are remapped to relay3/relay4 so the device
-    // forwards them via LoRa to the Blue Pill slave (test setup).
     const out = {};
-    if (pumpId === 'pump03' || pumpId === 'pump04') {
-      if (cmd.relay1 !== undefined) out.relay3 = cmd.relay1;
-      if (cmd.relay2 !== undefined) out.relay4 = cmd.relay2;
-    } else {
-      if (cmd.relay1 !== undefined) out.relay1 = cmd.relay1;
-      if (cmd.relay2 !== undefined) out.relay2 = cmd.relay2;
-    }
-    if (cmd.relay3 !== undefined) out.relay3 = cmd.relay3;
-    if (cmd.relay4 !== undefined) out.relay4 = cmd.relay4;
+    Object.entries(cfg.cmdRelayMap).forEach(([fbField, mqttField]) => {
+      if (cmd[fbField] !== undefined) out[mqttField] = cmd[fbField];
+    });
     if (Object.keys(out).length === 0) return;
-    const payload = JSON.stringify(out);
 
-    mqttClient.publish(cmdTopic, payload, { qos: 1 }, (err) => {
-      if (err) console.error(`[MQTT] Publish error on ${cmdTopic}:`, err.message);
-      else     console.log(`[MQTT] Command sent → ${cmdTopic}:`, payload);
+    mqttClient.publish(cmdTopic, JSON.stringify(out), { qos: 1 }, (err) => {
+      if (err) console.error(`[MQTT] Cmd error on ${cmdTopic}:`, err.message);
+      else     console.log(`[MQTT] Cmd → ${cmdTopic}:`, JSON.stringify(out));
     });
   });
+  console.log(`[FB] Listening commands: ${cfg.fbBase}/cmd`);
 
-  console.log(`[FB] Listening for commands on ${fbPath}`);
-
-  // Firebase → MQTT OTA trigger
-  // Flutter app writes {url: "https://..."} to pumps/pump01/ota
-  // bridge forwards it as MQTT to pump/01/ota so the STM32 starts the download
-  const otaFbPath   = `pumps/${pumpId}/ota`;
-  const otaMqttTopic = `pump/${mqttNum}/ota`;
-  let otaInitialized = false;
-
-  db.ref(otaFbPath).on('value', (snapshot) => {
-    if (!otaInitialized) {
-      otaInitialized = true;
-      return; // skip initial read — only forward new writes
-    }
-    const cmd = snapshot.val();
-    if (!cmd || !cmd.url) {
-      // OTA node deleted — clear retained MQTT message so board doesn't re-trigger on reconnect
-      mqttClient.publish(otaMqttTopic, '', { qos: 1, retain: true },
-        () => console.log(`[OTA] Cleared retained on ${otaMqttTopic}`));
-      return;
-    }
-
-    // Attach reference CRC if the URL matches one of our served firmware files
-    const payloadObj = { url: cmd.url };
-    for (const [fname, crc] of Object.entries(firmwareCrcs)) {
-      if (cmd.url.endsWith('/' + fname)) {
-        payloadObj.crc32 = crc;
-        console.log(`[OTA] Attaching CRC32 ${crc} for ${fname}`);
-        break;
-      }
-    }
-    const payload = JSON.stringify(payloadObj);
-    mqttClient.publish(otaMqttTopic, payload, { qos: 1, retain: true }, (err) => {
-      if (err) console.error(`[MQTT] OTA publish error on ${otaMqttTopic}:`, err.message);
-      else     console.log(`[FB→MQTT] OTA URL forwarded → ${otaMqttTopic}:`, cmd.url);
-    });
-  });
-
-  console.log(`[FB] Listening for OTA commands on ${otaFbPath}`);
-
-  // Firebase → MQTT LoRa OTA trigger (pump03 only)
-  // Flutter app writes {url: "https://..."} to pumps/pump03/lora_ota_cmd
-  // Bridge forwards it as MQTT to pump/03/lora_ota so EC200U starts LoRa OTA
-  if (pumpId === 'pump03') {
-    const loraOtaFbPath   = `pumps/${pumpId}/lora_ota_cmd`;
-    const loraOtaMqttTopic = `pump/${mqttNum}/lora_ota`;
-    let loraOtaInitialized = false;
-
-    db.ref(loraOtaFbPath).on('value', (snapshot) => {
-      if (!loraOtaInitialized) {
-        loraOtaInitialized = true;
-        return; // skip initial read — only forward new writes
-      }
-      const cmd = snapshot.val();
-      if (!cmd || !cmd.url) return;
-
-      const payload = JSON.stringify({ url: cmd.url });
-      mqttClient.publish(loraOtaMqttTopic, payload, { qos: 1 }, (err) => {
-        if (err) console.error(`[MQTT] LoRa OTA publish error on ${loraOtaMqttTopic}:`, err.message);
-        else     console.log(`[FB→MQTT] LoRa OTA URL forwarded → ${loraOtaMqttTopic}:`, cmd.url);
-      });
-    });
-    console.log(`[FB] Listening for LoRa OTA commands on ${loraOtaFbPath}`);
-  }
-
-  // Firebase → MQTT protection settings
-  // Flutter writes {ov,uv,pl,dry_i,dry_t} to pumps/pump01/settings
-  // Bridge publishes as retained MQTT so device receives settings on every reconnect
-  const settingsFbPath   = `pumps/${pumpId}/settings`;
-  const settingsMqttTopic = `pump/${mqttNum}/settings`;
-
-  db.ref(settingsFbPath).on('value', (snapshot) => {
+  // ── Settings ──
+  db.ref(`${cfg.fbBase}/settings`).on('value', (snapshot) => {
     const s = snapshot.val();
     if (!s) return;
-    // Validate threshold ordering: OV must be > UV must be > PL
     if (s.ov !== undefined && s.uv !== undefined && s.pl !== undefined) {
       if (s.ov <= s.uv || s.uv <= s.pl) {
-        console.error(`[CFG:${pumpId}] Invalid settings rejected — ov(${s.ov}) must be > uv(${s.uv}) must be > pl(${s.pl})`);
+        console.error(`[CFG:${cfg.label}] Invalid settings rejected — ov(${s.ov}) > uv(${s.uv}) > pl(${s.pl}) required`);
         return;
       }
     }
@@ -350,73 +325,72 @@ PUMPS.forEach((pumpId) => {
       uv_rst: s.uv_rst ?? 300,
     };
     if (s.hp != null) out.hp = s.hp;
-    const payload = JSON.stringify(out);
-    latestSettingsPayload[pumpId] = { topic: settingsMqttTopic, payload };
-    mqttClient.publish(settingsMqttTopic, payload, { qos: 1, retain: true }, (err) => {
-      if (err) console.error(`[MQTT] Settings publish error on ${settingsMqttTopic}:`, err.message);
-      else     console.log(`[FB→MQTT] Settings → ${settingsMqttTopic}:`, payload);
+    const payloadStr = JSON.stringify(out);
+    latestSettingsPayload[`${cfg.fbBase}/settings`] = { topic: settingsTopic, payload: payloadStr };
+    mqttClient.publish(settingsTopic, payloadStr, { qos: 1, retain: true }, (err) => {
+      if (err) console.error(`[MQTT] Settings error on ${settingsTopic}:`, err.message);
+      else     console.log(`[FB→MQTT] Settings → ${settingsTopic}:`, payloadStr);
     });
   });
+  console.log(`[FB] Listening settings: ${cfg.fbBase}/settings`);
 
-  console.log(`[FB] Listening for settings on ${settingsFbPath}`);
-});
-
-// ─── Rotation schedule — per-site, alternate pumps every N minutes ────────────
-const SITE_CONFIGS = [
-  { id: 'site01', pumps: ['pump01', 'pump02'] },
-  { id: 'site02', pumps: ['pump03', 'pump04'] },
-];
-
-const rotationSchedules = {};
-SITE_CONFIGS.forEach(({ id }) => {
-  db.ref(`sites/${id}/rotation_schedule`).on('value', (snap) => {
-    rotationSchedules[id] = snap.val();
-  });
-  console.log(`[FB] Listening for rotation on sites/${id}/rotation_schedule`);
-});
-
-setInterval(() => {
-  SITE_CONFIGS.forEach(({ id, pumps }) => {
-    const rs = rotationSchedules[id];
-    if (!rs || !rs.enabled) return;
-
-    const now        = Date.now();
-    const intervalMs = (rs.interval_minutes || 240) * 60 * 1000;
-    const startedAt  = rs.started_at || 0;
-    const pump1 = pumps[0];
-    const pump2 = pumps[1];
-
-    if (startedAt === 0) {
-      const p1Num = pump1.replace('pump', '');
-      mqttClient.publish(`pump/${p1Num}/cmd`, JSON.stringify({ relay1: 1, src: 'rot' }), { qos: 1 });
-      db.ref(`sites/${id}/rotation_schedule`).update({ current_pump: pump1, started_at: now });
-      console.log(`[Rotation:${id}] Started — ${pump1} ON`);
+  // ── OTA firmware trigger ──
+  let otaInitialized = false;
+  db.ref(`${cfg.fbBase}/ota`).on('value', (snapshot) => {
+    if (!otaInitialized) { otaInitialized = true; return; }
+    const cmd = snapshot.val();
+    if (!cmd || !cmd.url) {
+      mqttClient.publish(otaTopic, '', { qos: 1, retain: true },
+        () => console.log(`[OTA] Cleared retained on ${otaTopic}`));
       return;
     }
-
-    if (now - startedAt >= intervalMs) {
-      const current = rs.current_pump || pump1;
-      const next    = current === pump1 ? pump2 : pump1;
-      const curNum  = current.replace('pump', '');
-      const nxtNum  = next.replace('pump', '');
-
-      // Turn current off, then turn next on after 2 s
-      mqttClient.publish(`pump/${curNum}/cmd`, JSON.stringify({ relay1: 0, src: 'rot' }), { qos: 1 });
-      setTimeout(() => {
-        mqttClient.publish(`pump/${nxtNum}/cmd`, JSON.stringify({ relay1: 1, src: 'rot' }), { qos: 1 });
-      }, 2000);
-
-      db.ref(`sites/${id}/rotation_schedule`).update({ current_pump: next, started_at: now });
-      console.log(`[Rotation:${id}] ${current} → ${next}`);
+    const payloadObj = { url: cmd.url };
+    for (const [fname, crc] of Object.entries(firmwareCrcs)) {
+      if (cmd.url.endsWith('/' + fname)) { payloadObj.crc32 = crc; break; }
     }
+    mqttClient.publish(otaTopic, JSON.stringify(payloadObj), { qos: 1, retain: true }, (err) => {
+      if (err) console.error(`[MQTT] OTA error on ${otaTopic}:`, err.message);
+      else     console.log(`[FB→MQTT] OTA → ${otaTopic}:`, cmd.url);
+    });
   });
-}, 60000);
+  console.log(`[FB] Listening OTA: ${cfg.fbBase}/ota`);
+});
 
-// ─── Schedule execution — check every minute, publish ON/OFF commands ────────
+// ── LoRa OTA trigger (site02/line1/pump1 only — pump/03/lora_ota) ──────────────
+{
+  const loraOtaFbPath    = 'sites/site02/line01/pump01/lora_ota_cmd';
+  const loraOtaMqttTopic = 'pump/03/lora_ota';
+  let loraOtaInit = false;
+  db.ref(loraOtaFbPath).on('value', (snapshot) => {
+    if (!loraOtaInit) { loraOtaInit = true; return; }
+    const cmd = snapshot.val();
+    if (!cmd || !cmd.url) return;
+    mqttClient.publish(loraOtaMqttTopic, JSON.stringify({ url: cmd.url }), { qos: 1 }, (err) => {
+      if (err) console.error(`[MQTT] LoRa OTA error on ${loraOtaMqttTopic}:`, err.message);
+      else     console.log(`[FB→MQTT] LoRa OTA → ${loraOtaMqttTopic}:`, cmd.url);
+    });
+  });
+  console.log(`[FB] Listening LoRa OTA: ${loraOtaFbPath}`);
+}
+
+// ─── Rotation schedule — stored in Firebase, executed by STM32 firmware ───────
+// The bridge only caches the schedule document so the app can read/write it.
+// Rotation execution (timing, relay switching) is handled by the STM32 device.
+// Firebase paths: sites/{siteId}/lines/line1/rotation_schedule
+const ROTATION_FB_PATHS = [
+  'sites/site01/line01/rotation_schedule',
+  'sites/site02/line01/rotation_schedule',
+];
+ROTATION_FB_PATHS.forEach((fbPath) => {
+  db.ref(fbPath).on('value', () => {}); // keep connection open for app reads/writes
+  console.log(`[FB] Watching rotation: ${fbPath}`);
+});
+
+// ─── Schedule — per pump ──────────────────────────────────────────────────────
 const schedules = {};
-PUMPS.forEach((pumpId) => {
-  db.ref(`pumps/${pumpId}/schedule`).on('value', (snapshot) => {
-    schedules[pumpId] = snapshot.val();
+PUMP_CONFIGS.forEach((cfg) => {
+  db.ref(`${cfg.fbBase}/schedule`).on('value', (snapshot) => {
+    schedules[cfg.fbBase] = snapshot.val();
   });
 });
 
@@ -424,61 +398,32 @@ setInterval(() => {
   const now = new Date();
   const h = now.getHours();
   const m = now.getMinutes();
-  PUMPS.forEach((pumpId) => {
-    const s = schedules[pumpId];
+  PUMP_CONFIGS.forEach((cfg) => {
+    const s = schedules[cfg.fbBase];
     if (!s || !s.enabled) return;
-    const mqttNum = pumpId.replace('pump', '');
-    const cmdTopic = `pump/${mqttNum}/cmd`;
-    if (h === s.on_hour && m === s.on_min) {
-      mqttClient.publish(cmdTopic, JSON.stringify({ relay1: 1, src: 'sched' }), { qos: 1 });
-      console.log(`[Schedule] ${pumpId} → ON (${h}:${String(m).padStart(2,'0')})`);
-    } else if (h === s.off_hour && m === s.off_min) {
-      mqttClient.publish(cmdTopic, JSON.stringify({ relay1: 0, src: 'sched' }), { qos: 1 });
-      console.log(`[Schedule] ${pumpId} → OFF (${h}:${String(m).padStart(2,'0')})`);
-    }
+    const cmdTopic = `pump/${cfg.mqttNum}/cmd`;
+    const relay    = Object.keys(cfg.cmdRelayMap)[0]; // first relay field
+    if (h === s.on_hour  && m === s.on_min)
+      mqttClient.publish(cmdTopic, JSON.stringify({ [relay]: 1, src: 'sched' }), { qos: 1 });
+    if (h === s.off_hour && m === s.off_min)
+      mqttClient.publish(cmdTopic, JSON.stringify({ [relay]: 0, src: 'sched' }), { qos: 1 });
   });
-}, 60000); // fires every minute
+}, 60000);
 
-
-// ─── Offline detection — mark pump offline if no status for 90 s ─────────────
-// pump02 heartbeat fires every 60 s (firmware); 90 s gives a safe margin.
-// Once firmware is updated via OTA to publish status2 every 10 s, this can
-// be tightened back to 30 s.
-setInterval(() => {
-  const now = Date.now();
-  PUMPS.forEach((pumpId) => {
-    if (lastSeen[pumpId] && now - lastSeen[pumpId] > 90000) {
-      db.ref(`pumps/${pumpId}/status/online`).set(false).catch(() => {});
-      if (!offlineNotified[pumpId]) {
-        offlineNotified[pumpId] = true;
-        sendFCM(pumpId, `${pumpLabel(pumpId)} — Offline`, 'Device has stopped sending heartbeats');
-      }
-    }
-  });
-}, 15000);
-
-// ─── Firmware file server — serves firmware.bin with no redirect ─────────────
-// Railway injects PORT; EC200U downloads from https://<railway-host>/firmware.bin
-// Place firmware.bin in the same folder as bridge.js, then redeploy.
-const PORT          = process.env.PORT || 3000;
+// ─── Firmware file server ─────────────────────────────────────────────────────
+const PORT               = process.env.PORT || 3000;
 const FIRMWARE_FILE      = path.join(__dirname, 'firmware.bin');
 const FIRMWARE_TEST_FILE = path.join(__dirname, 'firmware_test.bin');
 
-// ─── CRC32 (IEEE 802.3, poly 0xEDB88320) — matches ota.c implementation ──────
-// Used to embed a reference CRC in OTA trigger messages so the STM32 can detect
-// stream corruption before writing the OTA flags page.
 function computeCrc32(buf) {
   let crc = 0xFFFFFFFF;
   for (let i = 0; i < buf.length; i++) {
     crc ^= buf[i];
-    for (let b = 0; b < 8; b++) {
-      crc = (crc >>> 1) ^ ((crc & 1) ? 0xEDB88320 : 0);
-    }
+    for (let b = 0; b < 8; b++) crc = (crc >>> 1) ^ ((crc & 1) ? 0xEDB88320 : 0);
   }
   return ((crc ^ 0xFFFFFFFF) >>> 0);
 }
 
-// Pre-compute CRC32 for each firmware file at startup so OTA triggers can include it.
 const firmwareCrcs = {};
 [['firmware.bin', FIRMWARE_FILE], ['firmware_test.bin', FIRMWARE_TEST_FILE]].forEach(([name, fpath]) => {
   if (fs.existsSync(fpath)) {
@@ -489,9 +434,7 @@ const firmwareCrcs = {};
 });
 
 function serveFirmware(req, res, filePath, fileName) {
-  if (!fs.existsSync(filePath)) {
-    res.writeHead(503); res.end(`${fileName} not present`); return;
-  }
+  if (!fs.existsSync(filePath)) { res.writeHead(503); res.end(`${fileName} not present`); return; }
   const stat = fs.statSync(filePath);
   res.writeHead(200, {
     'Content-Type':        'application/octet-stream',
@@ -510,13 +453,9 @@ function serveFirmware(req, res, filePath, fileName) {
 
 const fileServer = http.createServer((req, res) => {
   const reqPath = (req.url || '').split('?')[0];
-  if (reqPath === '/firmware.bin') {
-    serveFirmware(req, res, FIRMWARE_FILE, 'firmware.bin');
-  } else if (reqPath === '/firmware_test.bin') {
-    serveFirmware(req, res, FIRMWARE_TEST_FILE, 'firmware_test.bin');
-  } else {
-    res.writeHead(404); res.end('Not found');
-  }
+  if      (reqPath === '/firmware.bin')      serveFirmware(req, res, FIRMWARE_FILE,      'firmware.bin');
+  else if (reqPath === '/firmware_test.bin') serveFirmware(req, res, FIRMWARE_TEST_FILE, 'firmware_test.bin');
+  else { res.writeHead(404); res.end('Not found'); }
 });
 
 fileServer.listen(PORT, () =>
