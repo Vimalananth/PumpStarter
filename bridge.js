@@ -296,6 +296,7 @@ PUMP_CONFIGS.forEach((cfg) => {
     Object.entries(cfg.cmdRelayMap).forEach(([fbField, mqttField]) => {
       if (cmd[fbField] !== undefined) out[mqttField] = cmd[fbField];
     });
+    if (cmd.reset !== undefined) out.reset = cmd.reset;
     if (Object.keys(out).length === 0) return;
 
     mqttClient.publish(cmdTopic, JSON.stringify(out), { qos: 1 }, (err) => {
