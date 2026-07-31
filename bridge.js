@@ -292,11 +292,17 @@ PUMP_CONFIGS.forEach((cfg) => {
     const cmd = snapshot.val();
     if (!cmd) return;
 
+    if (cmd.reset === 1) {
+      mqttClient.publish(cmdTopic, 'RESET', { qos: 1 }, (err) => {
+        if (err) console.error(`[MQTT] Reset error on ${cmdTopic}:`, err.message);
+        else     console.log(`[MQTT] Reset → ${cmdTopic}`);
+      });
+      return;
+    }
     const out = {};
     Object.entries(cfg.cmdRelayMap).forEach(([fbField, mqttField]) => {
       if (cmd[fbField] !== undefined) out[mqttField] = cmd[fbField];
     });
-    if (cmd.reset !== undefined) out.reset = cmd.reset;
     if (Object.keys(out).length === 0) return;
 
     mqttClient.publish(cmdTopic, JSON.stringify(out), { qos: 1 }, (err) => {
