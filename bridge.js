@@ -185,6 +185,7 @@ mqttClient.on('message', (topic, message) => {
     const mapping = TOPIC_MAP[topic];
     if (!mapping) return;
 
+    if (payload.ts > 0 && payload.ts < 1e12) payload.ts = payload.ts * 1000; // seconds → ms
     if (!payload.ts) payload.ts = Date.now();
 
     // ── OTA status: clear retained OTA trigger after reboot ──────────────────
