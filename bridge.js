@@ -380,18 +380,78 @@ PUMP_CONFIGS.forEach((cfg) => {
   console.log(`[FB] Listening LoRa OTA: ${loraOtaFbPath}`);
 }
 
-// ─── Rotation schedule — stored in Firebase, executed by STM32 firmware ───────
-// The bridge only caches the schedule document so the app can read/write it.
-// Rotation execution (timing, relay switching) is handled by the STM32 device.
-// Firebase paths: sites/{siteId}/lines/line1/rotation_schedule
-const ROTATION_FB_PATHS = [
-  'sites/site01/line01/rotation_schedule',
-  'sites/site02/line01/rotation_schedule',
+// ─── Rotation schedule executor ───────────────────────────────────────────────
+// Bridge watches Firebase rotation_schedule docs and performs pump switching.
+// Every minute: if enabled and interval elapsed → turn off current pump,
+// wait 2 s, turn on next pump, update current_pump + started_at in Firebase.
+const ROTATION_CONFIGS = [
+  {
+    fbPath: 'sites/site01/line01/rotation_schedule',
+    label:  'Site01',
+    pumps: [
+      { id: 'pump01', fbBase: 'sites/site01/line01/pump01' },
+      { id: 'pump02', fbBase: 'sites/site01/line01/pump02' },
+    ],
+  },
+  {
+    fbPath: 'sites/site02/line01/rotation_schedule',
+    label:  'Site02',
+    pumps: [
+      { id: 'pump03', fbBase: 'sites/site02/line01/pump01' },
+      { id: 'pump04', fbBase: 'sites/site02/line01/pump02' },
+    ],
+  },
 ];
-ROTATION_FB_PATHS.forEach((fbPath) => {
-  db.ref(fbPath).on('value', () => {}); // keep connection open for app reads/writes
-  console.log(`[FB] Watching rotation: ${fbPath}`);
+
+const rotationState = {};
+
+ROTATION_CONFIGS.forEach((rc) => {
+  rotationState[rc.fbPath] = { pumps: rc.pumps, label: rc.label };
+  db.ref(rc.fbPath).on('value', (snapshot) => {
+    const data = snapshot.val() || {};
+    rotationState[rc.fbPath] = { ...data, pumps: rc.pumps, label: rc.label };
+  });
+  console.log(`[ROT] Watching: ${rc.fbPath}`);
 });
+
+setInterval(async () => {
+  const now = Date.now();
+  for (const [fbPath, state] of Object.entries(rotationState)) {
+    const { pumps, label, enabled, interval_minutes, current_pump, started_at } = state;
+    if (!enabled || !pumps) continue;
+
+    // Initialize started_at when first enabled (Flutter writes started_at:0 on save)
+    if (!started_at) {
+      const initPump = current_pump ?? pumps[0].id;
+      await db.ref(fbPath).update({ current_pump: initPump, started_at: now })
+        .catch(e => console.error(`[ROT] ${label}: init error:`, e.message));
+      console.log(`[ROT] ${label}: initialized, current=${initPump}`);
+      continue;
+    }
+
+    const elapsed  = now - started_at;
+    const interval = (interval_minutes ?? 240) * 60 * 1000;
+    if (elapsed < interval) continue;
+
+    // Interval elapsed — switch to next pump
+    const currentIdx  = pumps.findIndex(p => p.id === (current_pump ?? pumps[0].id));
+    const safeIdx     = currentIdx < 0 ? 0 : currentIdx;
+    const nextIdx     = (safeIdx + 1) % pumps.length;
+    const currentPump = pumps[safeIdx];
+    const nextPump    = pumps[nextIdx];
+
+    console.log(`[ROT] ${label}: switching ${currentPump.id} → ${nextPump.id}`);
+    try {
+      await db.ref(`${currentPump.fbBase}/cmd`).set({ relay1: 0 });
+      await new Promise(r => setTimeout(r, 2000));
+      await db.ref(`${nextPump.fbBase}/cmd`).set({ relay1: 1 });
+      await db.ref(fbPath).update({ current_pump: nextPump.id, started_at: now });
+      console.log(`[ROT] ${label}: done → ${nextPump.id}, next in ${interval_minutes}m`);
+    } catch (e) {
+      console.error(`[ROT] ${label}: switch error:`, e.message);
+    }
+  }
+}, 60000);
 
 // ─── Schedule — per pump ──────────────────────────────────────────────────────
 const schedules = {};
