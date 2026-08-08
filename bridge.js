@@ -382,13 +382,18 @@ PUMP_CONFIGS.forEach((cfg) => {
 }
 
 // ─── Rotation schedule executor ───────────────────────────────────────────────
-// Bridge watches Firebase rotation_schedule docs and performs pump switching.
-// Every minute: if enabled and interval elapsed → turn off current pump,
-// confirm relay state from Firebase status (up to 30 s), then turn on next pump.
-// If the relay doesn't confirm OFF, Firebase state is NOT updated so the bridge
-// retries next minute (handles firmware-offline / MQTT-lost scenarios).
+// Switch flow:
+//   1. Send relay1:0 to current pump
+//   2. Poll relay1_state every 3 s (up to 30 s) — abort & retry next minute if not confirmed
+//   3. Send relay1:1 to next pump → update Firebase rotation state
+//   4. After VERIFY_DELAY_MS (5 min): read relay1_running / relay2_running from master status
+//      — if 0: automatically resend ON and send FCM (up to MAX_START_RETRIES times)
+//      — if still 0 after max retries: FCM alert, clear pending state
 
-// Poll {fbStatusPath}/relay1_state until it equals expectedVal or timeout expires.
+const VERIFY_DELAY_MS   = 5 * 60 * 1000; // wait after switch before checking current
+const MAX_START_RETRIES = 2;              // max auto-retries of ON command
+
+// Poll {fbStatusPath}/relay1_state every 3 s until it equals expectedVal or timeout.
 async function waitForRelayState(fbStatusPath, expectedVal, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -403,21 +408,28 @@ async function waitForRelayState(fbStatusPath, expectedVal, timeoutMs) {
   return false;
 }
 
+// pump01 and pump02 share one physical board — current data lives in pump01 status.
+// masterStatusPath: where relay1_running / relay2_running are published.
+// runningField: relay1_running for pump01/pump03, relay2_running for pump02/pump04.
 const ROTATION_CONFIGS = [
   {
     fbPath: 'sites/site01/line01/rotation_schedule',
     label:  'Site01',
     pumps: [
-      { id: 'pump01', fbBase: 'sites/site01/line01/pump01' },
-      { id: 'pump02', fbBase: 'sites/site01/line01/pump02' },
+      { id: 'pump01', fbBase: 'sites/site01/line01/pump01',
+        masterStatusPath: 'sites/site01/line01/pump01/status', runningField: 'relay1_running' },
+      { id: 'pump02', fbBase: 'sites/site01/line01/pump02',
+        masterStatusPath: 'sites/site01/line01/pump01/status', runningField: 'relay2_running' },
     ],
   },
   {
     fbPath: 'sites/site02/line01/rotation_schedule',
     label:  'Site02',
     pumps: [
-      { id: 'pump03', fbBase: 'sites/site02/line01/pump01' },
-      { id: 'pump04', fbBase: 'sites/site02/line01/pump02' },
+      { id: 'pump03', fbBase: 'sites/site02/line01/pump01',
+        masterStatusPath: 'sites/site02/line01/pump01/status', runningField: 'relay1_running' },
+      { id: 'pump04', fbBase: 'sites/site02/line01/pump02',
+        masterStatusPath: 'sites/site02/line01/pump01/status', runningField: 'relay2_running' },
     ],
   },
 ];
@@ -428,7 +440,9 @@ ROTATION_CONFIGS.forEach((rc) => {
   rotationState[rc.fbPath] = { pumps: rc.pumps, label: rc.label };
   db.ref(rc.fbPath).on('value', (snapshot) => {
     const data = snapshot.val() || {};
-    rotationState[rc.fbPath] = { ...data, pumps: rc.pumps, label: rc.label };
+    // Preserve in-memory pendingVerify — it is transient and must not be overwritten by Firebase
+    const prev = rotationState[rc.fbPath] || {};
+    rotationState[rc.fbPath] = { ...data, pumps: rc.pumps, label: rc.label, pendingVerify: prev.pendingVerify };
   });
   console.log(`[ROT] Watching: ${rc.fbPath}`);
 });
@@ -436,10 +450,48 @@ ROTATION_CONFIGS.forEach((rc) => {
 setInterval(async () => {
   const now = Date.now();
   for (const [fbPath, state] of Object.entries(rotationState)) {
-    const { pumps, label, enabled, interval_minutes, current_pump, started_at } = state;
+    const { pumps, label, enabled, interval_minutes, current_pump, started_at, pendingVerify } = state;
     if (!enabled || !pumps) continue;
 
-    // Initialize started_at when first enabled (Flutter writes started_at:0 on save)
+    // ── Phase A: verify pump actually started (5 min after switch) ───────────
+    if (pendingVerify) {
+      if (now < pendingVerify.verifyAt) continue; // not time yet — skip Phase B too
+
+      const { nextPump, retryCount } = pendingVerify;
+      let running = 0;
+      try {
+        const snap = await db.ref(`${nextPump.masterStatusPath}/${nextPump.runningField}`).once('value');
+        running = snap.val() ?? 0;
+      } catch (e) {
+        console.error(`[ROT] ${label}: verify read error:`, e.message);
+      }
+
+      if (running) {
+        // Current confirmed — pump is running normally
+        console.log(`[ROT] ${label}: ${nextPump.id} confirmed RUNNING`);
+        rotationState[fbPath].pendingVerify = null;
+      } else if (retryCount < MAX_START_RETRIES) {
+        // Not running — automatically resend ON and schedule another check
+        const attempt = retryCount + 1;
+        console.warn(`[ROT] ${label}: ${nextPump.id} not running — auto-retry ON (${attempt}/${MAX_START_RETRIES})`);
+        await db.ref(`${nextPump.fbBase}/cmd`).set({ relay1: 1 })
+          .catch(e => console.error('[ROT] retry ON error:', e.message));
+        sendFCM(fcmTopic(nextPump.fbBase),
+          `${label} — Rotation Retry ${attempt}/${MAX_START_RETRIES}`,
+          `${nextPump.id} did not respond — ON command resent automatically`);
+        rotationState[fbPath].pendingVerify = { ...pendingVerify, retryCount: attempt, verifyAt: now + VERIFY_DELAY_MS };
+      } else {
+        // Max retries reached — send alert and clear
+        console.error(`[ROT] ${label}: ${nextPump.id} failed to start after ${MAX_START_RETRIES} retries`);
+        sendFCM(fcmTopic(nextPump.fbBase),
+          `${label} — Rotation Failed`,
+          `${nextPump.id} did not start after ${MAX_START_RETRIES} automatic retries`);
+        rotationState[fbPath].pendingVerify = null;
+      }
+      continue; // Phase B skipped while verify is active or just resolved
+    }
+
+    // ── Phase B: normal rotation interval check ──────────────────────────────
     if (!started_at) {
       const initPump = current_pump ?? pumps[0].id;
       await db.ref(fbPath).update({ current_pump: initPump, started_at: now })
@@ -478,6 +530,9 @@ setInterval(async () => {
       // Step 4: update rotation state only after relay confirmed off
       await db.ref(fbPath).update({ current_pump: nextPump.id, started_at: now });
       console.log(`[ROT] ${label}: done → ${nextPump.id}, next in ${interval_minutes}m`);
+
+      // Step 5: schedule current verification in 5 min
+      rotationState[fbPath].pendingVerify = { nextPump, verifyAt: now + VERIFY_DELAY_MS, retryCount: 0 };
     } catch (e) {
       console.error(`[ROT] ${label}: switch error:`, e.message);
     }
