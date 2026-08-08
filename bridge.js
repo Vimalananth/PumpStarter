@@ -384,7 +384,25 @@ PUMP_CONFIGS.forEach((cfg) => {
 // ─── Rotation schedule executor ───────────────────────────────────────────────
 // Bridge watches Firebase rotation_schedule docs and performs pump switching.
 // Every minute: if enabled and interval elapsed → turn off current pump,
-// wait 2 s, turn on next pump, update current_pump + started_at in Firebase.
+// confirm relay state from Firebase status (up to 30 s), then turn on next pump.
+// If the relay doesn't confirm OFF, Firebase state is NOT updated so the bridge
+// retries next minute (handles firmware-offline / MQTT-lost scenarios).
+
+// Poll {fbStatusPath}/relay1_state until it equals expectedVal or timeout expires.
+async function waitForRelayState(fbStatusPath, expectedVal, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      const snap = await db.ref(`${fbStatusPath}/relay1_state`).once('value');
+      if (snap.val() === expectedVal) return true;
+    } catch (e) {
+      console.error('[ROT] waitForRelayState error:', e.message);
+    }
+    await new Promise(r => setTimeout(r, 3000));
+  }
+  return false;
+}
+
 const ROTATION_CONFIGS = [
   {
     fbPath: 'sites/site01/line01/rotation_schedule',
@@ -443,9 +461,21 @@ setInterval(async () => {
 
     console.log(`[ROT] ${label}: switching ${currentPump.id} → ${nextPump.id}`);
     try {
+      // Step 1: turn off current pump
       await db.ref(`${currentPump.fbBase}/cmd`).set({ relay1: 0 });
-      await new Promise(r => setTimeout(r, 2000));
+
+      // Step 2: verify relay actually went off (poll Firebase status, up to 30 s)
+      const offConfirmed = await waitForRelayState(`${currentPump.fbBase}/status`, 0, 30000);
+      if (!offConfirmed) {
+        console.warn(`[ROT] ${label}: ${currentPump.id} did not confirm OFF after 30 s — aborting, will retry next cycle`);
+        continue; // leave current_pump / started_at unchanged → bridge retries in ~1 min
+      }
+      console.log(`[ROT] ${label}: ${currentPump.id} confirmed OFF`);
+
+      // Step 3: turn on next pump
       await db.ref(`${nextPump.fbBase}/cmd`).set({ relay1: 1 });
+
+      // Step 4: update rotation state only after relay confirmed off
       await db.ref(fbPath).update({ current_pump: nextPump.id, started_at: now });
       console.log(`[ROT] ${label}: done → ${nextPump.id}, next in ${interval_minutes}m`);
     } catch (e) {
