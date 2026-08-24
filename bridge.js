@@ -333,8 +333,9 @@ PUMP_CONFIGS.forEach((cfg) => {
       uv_rst: s.uv_rst ?? 300,
     };
     if (s.hp      != null) out.hp      = s.hp;
-    if (s.rot_en  != null) out.rot_en  = s.rot_en  ? 1 : 0;
-    if (s.rot_min != null) out.rot_min = s.rot_min;
+    if (s.rot_en   != null) out.rot_en   = s.rot_en  ? 1 : 0;
+    if (s.rot_min  != null) out.rot_min  = s.rot_min;
+    if (s.rot_min2 != null) out.rot_min2 = s.rot_min2;
     const payloadStr = JSON.stringify(out);
     latestSettingsPayload[`${cfg.fbBase}/settings`] = { topic: settingsTopic, payload: payloadStr };
     mqttClient.publish(settingsTopic, payloadStr, { qos: 1, retain: true }, (err) => {
