@@ -168,6 +168,12 @@ const ROTATION_LOG_MAP = {
   'pump/03/log': { rotPath: 'sites/site02/line01/rotation_schedule', pumpIds: ['pump03', 'pump04'] },
 };
 
+// ─── Run counter snapshots — midnight IST ─────────────────────────────────────
+// latestRunTotal: fbBase → latest run_total_s value (monotonically clamped).
+// Snapshotted once per day at local midnight (IST) into {fbBase}/run_daily/YYYY-MM-DD.
+const latestRunTotal   = {};
+let   lastSnapshotDate = '';
+
 // ─── MQTT events ──────────────────────────────────────────────────────────────
 const TOPICS_SUB = Object.keys(TOPIC_MAP);
 
@@ -228,6 +234,13 @@ mqttClient.on('message', (topic, message) => {
         }
       }
 
+      // Track run_total_s for midnight snapshot (monotonic clamp — never go backwards)
+      if (topic.endsWith('/status') && payload.run_total_s !== undefined) {
+        const fbBase = mapping.fbPath.replace('/status', '');
+        const prev = latestRunTotal[fbBase] ?? 0;
+        latestRunTotal[fbBase] = Math.max(prev, payload.run_total_s);
+      }
+
     } else {
       // push() — append log entry with auto-purge
       db.ref(mapping.fbPath).push(payload)
@@ -280,9 +293,11 @@ mqttClient.on('message', (topic, message) => {
   }
 });
 
-// ─── Offline detection — mark pump offline if no status for 15 min ────────────
+// ─── Offline detection + midnight run-counter snapshot ────────────────────────
 setInterval(() => {
   const now = Date.now();
+
+  // ── Offline detection — mark pump offline if no status for 15 min ──────────
   Object.keys(lastSeen).forEach((statusPath) => {
     if (now - lastSeen[statusPath] > OFFLINE_TIMEOUT_MS) {
       db.ref(statusPath + '/online').set(false).catch(() => {});
@@ -293,6 +308,23 @@ setInterval(() => {
       }
     }
   });
+
+  // ── Midnight IST snapshot — write run_total_s on date rollover ─────────────
+  const localDate = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' }); // YYYY-MM-DD
+  if (lastSnapshotDate !== '' && localDate !== lastSnapshotDate) {
+    // Date rolled over — snapshot each pump's last-known run_total_s.
+    // Write even if device is offline (counter is cumulative, delta still valid).
+    for (const cfg of PUMP_CONFIGS) {
+      const val = latestRunTotal[cfg.fbBase] ?? null;
+      if (val !== null) {
+        db.ref(`${cfg.fbBase}/run_daily/${lastSnapshotDate}`).set(val)
+          .then(() => console.log(`[SNAP] ${cfg.fbBase} run_daily/${lastSnapshotDate} = ${val}`))
+          .catch(e => console.error('[SNAP] error:', e.message));
+      }
+    }
+  }
+  lastSnapshotDate = localDate;
+
 }, 60000);
 
 // ─── Firebase → MQTT: commands, settings, OTA ────────────────────────────────
@@ -350,9 +382,10 @@ PUMP_CONFIGS.forEach((cfg) => {
       uv_rst: s.uv_rst ?? 300,
     };
     if (s.hp     != null) out.hp     = s.hp;
-    if (s.rot_en  != null) out.rot_en  = s.rot_en;
-    if (s.rot_min != null) out.rot_min = s.rot_min;
-    if (s.rot_min2!= null) out.rot_min2= s.rot_min2;
+    if (s.rot_en        != null) out.rot_en        = s.rot_en;
+    if (s.rot_min       != null) out.rot_min       = s.rot_min;
+    if (s.rot_min2      != null) out.rot_min2      = s.rot_min2;
+    if (s.rot_autostart != null) out.rot_autostart = s.rot_autostart;
     const payloadStr = JSON.stringify(out);
     latestSettingsPayload[`${cfg.fbBase}/settings`] = { topic: settingsTopic, payload: payloadStr };
     mqttClient.publish(settingsTopic, payloadStr, { qos: 1, retain: true }, (err) => {
