@@ -160,6 +160,20 @@ function purgeOldLogs(fbPath, cutoff) {
     .once('value', snap => snap.forEach(child => child.ref.remove()));
 }
 
+// ─── Rotation tracking — firmware-driven ──────────────────────────────────────
+// Maps MQTT log topic → rotation_schedule Firebase path + ordered pump IDs.
+// Bridge updates current_pump / started_at when firmware publishes a rotation event.
+const ROTATION_LOG_MAP = {
+  'pump/01/log': { rotPath: 'sites/site01/line01/rotation_schedule', pumpIds: ['pump01', 'pump02'] },
+  'pump/03/log': { rotPath: 'sites/site02/line01/rotation_schedule', pumpIds: ['pump03', 'pump04'] },
+};
+
+// ─── Run counter snapshots — midnight IST ─────────────────────────────────────
+// latestRunTotal: fbBase → latest run_total_s value (monotonically clamped).
+// Snapshotted once per day at local midnight (IST) into {fbBase}/run_daily/YYYY-MM-DD.
+const latestRunTotal   = {};
+let   lastSnapshotDate = '';
+
 // ─── MQTT events ──────────────────────────────────────────────────────────────
 const TOPICS_SUB = Object.keys(TOPIC_MAP);
 
@@ -220,6 +234,13 @@ mqttClient.on('message', (topic, message) => {
         }
       }
 
+      // Track run_total_s for midnight snapshot (monotonic clamp — never go backwards)
+      if (topic.endsWith('/status') && payload.run_total_s !== undefined) {
+        const fbBase = mapping.fbPath.replace('/status', '');
+        const prev = latestRunTotal[fbBase] ?? 0;
+        latestRunTotal[fbBase] = Math.max(prev, payload.run_total_s);
+      }
+
     } else {
       // push() — append log entry with auto-purge
       db.ref(mapping.fbPath).push(payload)
@@ -237,6 +258,15 @@ mqttClient.on('message', (topic, message) => {
         } else if (payload.event === 'off') {
           const runStr = payload.run_s ? ` — ran ${fmtRunTime(payload.run_s)}` : '';
           sendFCM(topic_fcm, `${label} Stopped`, `Turned OFF (${payload.reason || 'manual'})${runStr}`);
+        } else if (payload.event === 'rotation') {
+          // Firmware rotated — update Firebase so Flutter shows correct pump + countdown
+          const rm = ROTATION_LOG_MAP[topic];
+          if (rm) {
+            const newPump = rm.pumpIds[payload.to === 2 ? 1 : 0];
+            db.ref(rm.rotPath).update({ current_pump: newPump, started_at: Date.now() })
+              .then(() => console.log(`[ROT] firmware rotated → ${newPump} (${rm.rotPath})`))
+              .catch(e => console.error('[ROT] update error:', e.message));
+          }
         }
       }
 
@@ -263,9 +293,11 @@ mqttClient.on('message', (topic, message) => {
   }
 });
 
-// ─── Offline detection — mark pump offline if no status for 15 min ────────────
+// ─── Offline detection + midnight run-counter snapshot ────────────────────────
 setInterval(() => {
   const now = Date.now();
+
+  // ── Offline detection — mark pump offline if no status for 15 min ──────────
   Object.keys(lastSeen).forEach((statusPath) => {
     if (now - lastSeen[statusPath] > OFFLINE_TIMEOUT_MS) {
       db.ref(statusPath + '/online').set(false).catch(() => {});
@@ -276,6 +308,23 @@ setInterval(() => {
       }
     }
   });
+
+  // ── Midnight IST snapshot — write run_total_s on date rollover ─────────────
+  const localDate = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' }); // YYYY-MM-DD
+  if (lastSnapshotDate !== '' && localDate !== lastSnapshotDate) {
+    // Date rolled over — snapshot each pump's last-known run_total_s.
+    // Write even if device is offline (counter is cumulative, delta still valid).
+    for (const cfg of PUMP_CONFIGS) {
+      const val = latestRunTotal[cfg.fbBase] ?? null;
+      if (val !== null) {
+        db.ref(`${cfg.fbBase}/run_daily/${lastSnapshotDate}`).set(val)
+          .then(() => console.log(`[SNAP] ${cfg.fbBase} run_daily/${lastSnapshotDate} = ${val}`))
+          .catch(e => console.error('[SNAP] error:', e.message));
+      }
+    }
+  }
+  lastSnapshotDate = localDate;
+
 }, 60000);
 
 // ─── Firebase → MQTT: commands, settings, OTA ────────────────────────────────
@@ -332,10 +381,11 @@ PUMP_CONFIGS.forEach((cfg) => {
       dry_en: s.dry_en ?? 1,
       uv_rst: s.uv_rst ?? 300,
     };
-    if (s.hp      != null) out.hp      = s.hp;
-    if (s.rot_en   != null) out.rot_en   = s.rot_en  ? 1 : 0;
-    if (s.rot_min  != null) out.rot_min  = s.rot_min;
-    if (s.rot_min2 != null) out.rot_min2 = s.rot_min2;
+    if (s.hp     != null) out.hp     = s.hp;
+    if (s.rot_en        != null) out.rot_en        = s.rot_en;
+    if (s.rot_min       != null) out.rot_min       = s.rot_min;
+    if (s.rot_min2      != null) out.rot_min2      = s.rot_min2;
+    if (s.rot_autostart != null) out.rot_autostart = s.rot_autostart;
     const payloadStr = JSON.stringify(out);
     latestSettingsPayload[`${cfg.fbBase}/settings`] = { topic: settingsTopic, payload: payloadStr };
     mqttClient.publish(settingsTopic, payloadStr, { qos: 1, retain: true }, (err) => {
@@ -396,16 +446,32 @@ setInterval(() => {
   const now = new Date();
   const h = now.getHours();
   const m = now.getMinutes();
+  const offCmds = [];
+  const onCmds  = [];
   PUMP_CONFIGS.forEach((cfg) => {
     const s = schedules[cfg.fbBase];
     if (!s || !s.enabled) return;
     const cmdTopic = `pump/${cfg.mqttNum}/cmd`;
     const relay    = Object.keys(cfg.cmdRelayMap)[0]; // first relay field
-    if (h === s.on_hour  && m === s.on_min)
-      mqttClient.publish(cmdTopic, JSON.stringify({ [relay]: 1, src: 'sched' }), { qos: 1 });
     if (h === s.off_hour && m === s.off_min)
-      mqttClient.publish(cmdTopic, JSON.stringify({ [relay]: 0, src: 'sched' }), { qos: 1 });
+      offCmds.push({ cmdTopic, relay });
+    if (h === s.on_hour  && m === s.on_min)
+      onCmds.push({ cmdTopic, relay });
   });
+  // Fire OFF commands immediately
+  offCmds.forEach(({ cmdTopic, relay }) => {
+    mqttClient.publish(cmdTopic, JSON.stringify({ [relay]: 0, src: 'sched' }), { qos: 1 });
+    console.log(`[SCHED] OFF → ${cmdTopic}`);
+  });
+  // Fire ON commands after 5 s so relay fully opens before next pump starts
+  if (onCmds.length > 0) {
+    setTimeout(() => {
+      onCmds.forEach(({ cmdTopic, relay }) => {
+        mqttClient.publish(cmdTopic, JSON.stringify({ [relay]: 1, src: 'sched' }), { qos: 1 });
+        console.log(`[SCHED] ON  → ${cmdTopic}`);
+      });
+    }, 5000);
+  }
 }, 60000);
 
 // ─── Firmware file server ─────────────────────────────────────────────────────
